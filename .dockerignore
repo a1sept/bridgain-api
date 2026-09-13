@@ -1,0 +1,11 @@
+node_modules
+dist
+coverage
+.git
+**/.env
+**/.env.*
+**/secrets
+**/*.pem
+**/*.key
+*.log
+.DS_Store

@@ -7,3 +7,6 @@ coverage/
 *.log
 .DS_Store
 secrets/
+*.pem
+*.key
+*.tsbuildinfo
