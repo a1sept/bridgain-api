@@ -1,3 +1,5 @@
+import { ProjectWorkController } from "./workspace/project-work.controller.js";
+import { ProjectWorkService } from "./workspace/project-work.service.js";
 import { RequestsController } from "./workspace/requests.controller.js";
 import { RequestsService } from "./workspace/requests.service.js";
 import { WorkspaceController } from "./workspace/workspace.controller.js";
@@ -13,6 +15,7 @@ import { HealthController } from "./health.controller.js";
     AuthController,
     WorkspaceController,
     RequestsController,
+    ProjectWorkController,
   ],
   providers: [
     DatabaseService,
@@ -20,6 +23,7 @@ import { HealthController } from "./health.controller.js";
     WorkspaceService,
     WorkspaceController,
     RequestsService,
+    ProjectWorkService,
   ],
 })
 export class AppModule {}
