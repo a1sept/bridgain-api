@@ -15,6 +15,13 @@
       "when": 1789304703302,
       "tag": "0001_late_moon_knight",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789360524754,
+      "tag": "0002_overrated_pandemic",
+      "breakpoints": true
     }
   ]
 }
