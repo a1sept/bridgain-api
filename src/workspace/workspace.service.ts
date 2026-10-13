@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { projectTasks, taskReviewEvents } from "../db/schema/project-work.js";
 import { Injectable } from "@nestjs/common";
 import { and, asc, eq, ilike, inArray, ne, or } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -131,6 +133,11 @@ export class WorkspaceService {
       permissionRole:
         tms.find((t) => t.m.teamId === tid && t.u.id === user.id)?.m
           .permissionRole ?? null,
+      canApproveMerge:
+        user.accountType === "team" &&
+        (tms.find((t) => t.m.teamId === tid && t.u.id === user.id)?.m
+          .canApproveMerge ??
+          false),
       accessRole,
     });
     const ts = teamIds.length
@@ -505,7 +512,16 @@ export class WorkspaceService {
       !["admin", "member"].includes(body.permissionRole as string)
     )
       fail(400, "VALIDATION_ERROR", "관리 역할을 확인해주세요.");
-    if (values === undefined && body?.permissionRole === undefined)
+    if (
+      body?.canApproveMerge !== undefined &&
+      typeof body.canApproveMerge !== "boolean"
+    )
+      fail(400, "VALIDATION_ERROR", "병합 승인 권한을 확인해주세요.");
+    if (
+      values === undefined &&
+      body?.permissionRole === undefined &&
+      body?.canApproveMerge === undefined
+    )
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
       await tx.select().from(teams).where(eq(teams.id, teamId)).for("update");
@@ -530,11 +546,68 @@ export class WorkspaceService {
           "FORBIDDEN",
           "이 멤버의 직무 또는 권한을 변경할 수 없습니다.",
         );
-      if (body.permissionRole !== undefined)
+      if (body.canApproveMerge !== undefined) {
+        const [person] = await tx
+          .select()
+          .from(users)
+          .where(eq(users.id, userId));
+        if (
+          !person ||
+          person.accountType !== "team" ||
+          (body.canApproveMerge && person.status !== "active")
+        )
+          fail(
+            400,
+            "VALIDATION_ERROR",
+            "활성 개발자 계정에만 병합 승인 권한을 부여할 수 있습니다.",
+          );
+      }
+      if (
+        body.permissionRole !== undefined ||
+        body.canApproveMerge !== undefined
+      )
         await tx
           .update(tm)
-          .set({ permissionRole: next })
+          .set({
+            permissionRole: next,
+            ...(body.canApproveMerge !== undefined
+              ? { canApproveMerge: body.canApproveMerge as boolean }
+              : {}),
+          })
           .where(and(eq(tm.teamId, teamId), eq(tm.userId, userId)));
+      if (body.canApproveMerge === false && target.canApproveMerge) {
+        const ownedProjects = await tx
+          .select({ id: projects.id })
+          .from(projects)
+          .where(eq(projects.teamId, teamId));
+        if (ownedProjects.length) {
+          const invalidated = await tx
+            .update(projectTasks)
+            .set({ reviewStatus: "stale", version: randomUUID() })
+            .where(
+              and(
+                inArray(
+                  projectTasks.projectId,
+                  ownedProjects.map((p) => p.id),
+                ),
+                eq(projectTasks.mergeReviewerId, userId),
+                eq(projectTasks.mergeApprovalRequired, true),
+                eq(projectTasks.status, "in_progress"),
+                inArray(projectTasks.reviewStatus, ["pending", "approved"]),
+              ),
+            )
+            .returning();
+          for (const task of invalidated)
+            await tx.insert(taskReviewEvents).values({
+              taskId: task.id,
+              actorId: u.id,
+              action: "invalidated",
+              headSha: task.reviewHeadSha,
+              baseSha: task.reviewBaseSha,
+              note: "승인자의 팀 병합 승인 권한이 해제되었습니다.",
+            });
+        }
+      }
       if (values !== undefined) {
         await tx
           .delete(pos)
@@ -548,7 +621,12 @@ export class WorkspaceService {
             })),
           );
       }
-      return { userId, permissionRole: next, positions: values };
+      return {
+        userId,
+        permissionRole: next,
+        positions: values,
+        canApproveMerge: body.canApproveMerge ?? target.canApproveMerge,
+      };
     });
   }
 }

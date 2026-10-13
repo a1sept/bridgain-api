@@ -1,0 +1,1 @@
+ALTER TABLE "team_memberships" ADD COLUMN "can_approve_merge" boolean DEFAULT false NOT NULL;

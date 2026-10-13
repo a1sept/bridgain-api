@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   pgTable,
+  boolean,
   uuid,
   text,
   timestamp,
@@ -31,6 +32,7 @@ export const teamMemberships = pgTable(
       .notNull()
       .references(() => users.id),
     permissionRole: text("permission_role").notNull().default("member"),
+    canApproveMerge: boolean("can_approve_merge").notNull().default(false),
     createdAt: created(),
   },
   (t) => [

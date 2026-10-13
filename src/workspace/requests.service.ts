@@ -14,6 +14,13 @@ import {
   requestEvents as e,
   requestAttachments as f,
 } from "../db/schema/requests.js";
+import {
+  projectTasks,
+  taskRequests,
+  taskAssignees,
+  meetingRequests,
+  projectMeetings,
+} from "../db/schema/project-work.js";
 import { fail } from "../auth/security.js";
 import { uuid, bounded } from "./workspace.service.js";
 type User = { id: string; displayName: string; accountType: string };
@@ -105,7 +112,21 @@ export class RequestsService {
       .from(a)
       .innerJoin(users, eq(users.id, a.userId))
       .where(eq(a.requestId, request.id));
-    return { ...request, creatorName: creator?.name ?? "", assignees };
+    const assigned = await tx
+      .select({ userId: users.id, displayName: users.displayName })
+      .from(taskRequests)
+      .innerJoin(taskAssignees, eq(taskAssignees.taskId, taskRequests.taskId))
+      .innerJoin(users, eq(users.id, taskAssignees.userId))
+      .where(eq(taskRequests.requestId, request.id));
+    return {
+      ...request,
+      creatorName: creator?.name ?? "",
+      assignees: [
+        ...new Map(
+          [...assignees, ...assigned].map((x) => [x.userId, x]),
+        ).values(),
+      ],
+    };
   }
   private async files(tx: Tx, pid: string, rid: string) {
     const rows = await tx
@@ -182,7 +203,31 @@ export class RequestsService {
         .innerJoin(users, eq(users.id, e.actorId))
         .where(eq(e.requestId, rid))
         .orderBy(asc(e.createdAt), asc(e.id));
+      const workflowTasks = await tx
+        .select({
+          id: projectTasks.id,
+          title: projectTasks.title,
+          status: projectTasks.status,
+          resultSummary: projectTasks.resultSummary,
+        })
+        .from(taskRequests)
+        .innerJoin(projectTasks, eq(projectTasks.id, taskRequests.taskId))
+        .where(eq(taskRequests.requestId, rid));
+      const workflowMeetings = await tx
+        .select({
+          id: projectMeetings.id,
+          title: projectMeetings.title,
+          decisionStatus: projectMeetings.decisionStatus,
+          scheduledAt: projectMeetings.scheduledAt,
+        })
+        .from(meetingRequests)
+        .innerJoin(
+          projectMeetings,
+          eq(projectMeetings.id, meetingRequests.meetingId),
+        )
+        .where(eq(meetingRequests.requestId, rid));
       return {
+        workflow: { tasks: workflowTasks, meetings: workflowMeetings },
         request: await this.output(tx, request),
         events,
         attachments: await this.files(tx, pid, rid),
@@ -203,6 +248,17 @@ export class RequestsService {
       if (b.status === undefined && b.assigneeIds === undefined)
         fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
       if (b.status !== undefined) {
+        const linked = await tx
+          .select({ id: taskRequests.taskId })
+          .from(taskRequests)
+          .where(eq(taskRequests.requestId, rid))
+          .limit(1);
+        if (linked.length && b.status !== request.status)
+          fail(
+            409,
+            "TASK_MANAGED",
+            "연결된 개발 업무에서 진행 상태를 변경해주세요.",
+          );
         const status = bounded(b.status, 30);
         if (status !== request.status) {
           changed = true;

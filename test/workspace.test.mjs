@@ -281,3 +281,182 @@ test("member search authenticates before querying and disables caching", async (
   );
   assert.equal(headers["Cache-Control"], "no-store");
 });
+
+test("merge approver grants enforce team hierarchy and developer accounts, and support revocation", async () => {
+  const actorId = "00000000-0000-4000-8000-000000000001";
+  const targetId = "00000000-0000-4000-8000-000000000002";
+  const teamId = "00000000-0000-4000-8000-000000000003";
+  for (const scenario of [
+    { actor: "owner", target: "admin", value: true },
+    { actor: "admin", target: "member", value: true },
+    { actor: "admin", target: "member", value: false },
+    { actor: "owner", target: "owner", self: true, value: true },
+    { actor: "member", target: "member", self: true, value: true, error: 403 },
+    { actor: "admin", target: "admin", value: true, error: 403 },
+    { actor: "admin", target: "owner", value: true, error: 403 },
+    {
+      actor: "owner",
+      target: "member",
+      account: "client",
+      value: true,
+      error: 400,
+    },
+    {
+      actor: "owner",
+      target: "member",
+      status: "suspended",
+      value: true,
+      error: 400,
+    },
+    { actor: "owner", target: "member", status: "suspended", value: false },
+    { actor: "owner", target: "member", value: "true", error: 400 },
+  ]) {
+    let query = 0;
+    const writes = [];
+    const target = scenario.self ? actorId : targetId;
+    const rows = [
+      {
+        userId: actorId,
+        permissionRole: scenario.actor,
+        canApproveMerge: false,
+      },
+      ...(scenario.self
+        ? []
+        : [
+            {
+              userId: targetId,
+              permissionRole: scenario.target,
+              canApproveMerge: true,
+            },
+          ]),
+    ];
+    const results = [
+      [{ id: teamId }],
+      rows,
+      [
+        {
+          id: target,
+          accountType: scenario.account ?? "team",
+          status: scenario.status ?? "active",
+        },
+      ],
+    ];
+    const tx = {
+      select: () => ({
+        from: () => ({
+          where: () => {
+            const result = results[query++] ?? [];
+            return {
+              for: async () => result,
+              then: (resolve, reject) =>
+                Promise.resolve(result).then(resolve, reject),
+            };
+          },
+        }),
+      }),
+      update: () => ({
+        set: (value) => ({
+          where: async () => {
+            writes.push(value);
+          },
+        }),
+      }),
+    };
+    const service = new WorkspaceService({
+      db: { transaction: async (fn) => fn(tx) },
+    });
+    const action = service.member(
+      { id: actorId, accountType: "team", displayName: "Actor" },
+      teamId,
+      target,
+      { canApproveMerge: scenario.value },
+    );
+    if (scenario.error) {
+      await assert.rejects(action, (e) => e.getStatus?.() === scenario.error);
+      assert.equal(writes.length, 0);
+    } else {
+      const result = await action;
+      assert.equal(result.canApproveMerge, scenario.value);
+      assert.equal(writes.length, 1);
+      assert.equal(writes[0].canApproveMerge, scenario.value);
+      assert.equal(writes[0].permissionRole, scenario.target);
+    }
+  }
+});
+
+test("revoking a team approver invalidates active reviews and records who revoked permission", async () => {
+  const { teams, teamMemberships, projects } =
+    await import("../dist/db/schema/workspace.js");
+  const { users } = await import("../dist/db/schema/auth.js");
+  const { projectTasks, taskReviewEvents } =
+    await import("../dist/db/schema/project-work.js");
+  const owner = "00000000-0000-4000-8000-000000000001";
+  const reviewer = "00000000-0000-4000-8000-000000000002";
+  const tid = "00000000-0000-4000-8000-000000000003";
+  const pid = "00000000-0000-4000-8000-000000000004";
+  const task = {
+    id: "00000000-0000-4000-8000-000000000005",
+    reviewHeadSha: "a".repeat(40),
+    reviewBaseSha: "b".repeat(40),
+  };
+  const writes = [],
+    history = [];
+  const chain = (fn) => {
+    const q = {
+      then: (resolve, reject) =>
+        Promise.resolve().then(fn).then(resolve, reject),
+    };
+    for (const name of ["where", "for", "returning"]) q[name] = () => q;
+    return q;
+  };
+  const tx = {
+    select: () => ({
+      from: (table) =>
+        chain(() => {
+          if (table === teams) return [{ id: tid }];
+          if (table === teamMemberships)
+            return [
+              {
+                userId: owner,
+                permissionRole: "owner",
+                canApproveMerge: false,
+              },
+              {
+                userId: reviewer,
+                permissionRole: "member",
+                canApproveMerge: true,
+              },
+            ];
+          if (table === users)
+            return [{ id: reviewer, accountType: "team", status: "active" }];
+          if (table === projects) return [{ id: pid }];
+          return [];
+        }),
+    }),
+    update: (table) => ({
+      set: (values) =>
+        chain(() => {
+          writes.push({ table, values });
+          return table === projectTasks ? [task] : [];
+        }),
+    }),
+    insert: (table) => ({
+      values: (value) =>
+        chain(() => {
+          if (table === taskReviewEvents) history.push(value);
+        }),
+    }),
+  };
+  const service = new WorkspaceService({ db: { transaction: (fn) => fn(tx) } });
+  await service.member({ id: owner, accountType: "team" }, tid, reviewer, {
+    canApproveMerge: false,
+  });
+  assert.equal(
+    writes.find((w) => w.table === projectTasks).values.reviewStatus,
+    "stale",
+  );
+  assert.equal(history.length, 1);
+  assert.equal(history[0].actorId, owner);
+  assert.equal(history[0].taskId, task.id);
+  assert.equal(history[0].headSha, task.reviewHeadSha);
+});

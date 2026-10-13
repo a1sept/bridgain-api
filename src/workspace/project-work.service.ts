@@ -1,3 +1,8 @@
+import { randomUUID } from "node:crypto";
+import {
+  requireMergeReviewer,
+  requireApprovedReview,
+} from "./merge-review-policy.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, ne, inArray, desc, sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -9,6 +14,10 @@ import {
 } from "../db/schema/workspace.js";
 import { projectRequests, requestEvents } from "../db/schema/requests.js";
 import {
+  taskResultEntries,
+  taskReviewEvents,
+  meetingRequests,
+  documentVersions,
   projectTasks as tasks,
   taskAssignees,
   taskRequests,
@@ -19,6 +28,7 @@ import {
 import { RequestsService } from "./requests.service.js";
 import { bounded, uuid } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
+import type { GitEvent } from "./git-events.controller.js";
 type User = { id: string; displayName: string; accountType: string };
 type Tx = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
 export function choice(value: unknown, values: string[]) {
@@ -70,12 +80,58 @@ export function meetingDate(value: unknown): Date {
   dueDate((value as string).slice(0, 10));
   return new Date(value as string);
 }
+export function requestProgress(statuses: string[]) {
+  if (!statuses.length) return "received";
+  return statuses.every((s) => s === "released")
+    ? "released"
+    : statuses.every((s) => ["done", "released"].includes(s))
+      ? "completed"
+      : statuses.some((s) => s !== "todo")
+        ? "in_progress"
+        : "received";
+}
+export function taskLifecycle(
+  oldStatus: string,
+  requested: string,
+  branch: string,
+  summary: string,
+  commit: string,
+  deployment: string | null,
+) {
+  const status = choice(requested, ["todo", "in_progress", "done", "released"]);
+  const allowed: Record<string, string[]> = {
+    todo: ["todo", "in_progress"],
+    in_progress: ["in_progress", "done"],
+    done: ["done", "in_progress", "released"],
+    released: ["released", "in_progress"],
+  };
+  if (!allowed[oldStatus]?.includes(status))
+    fail(400, "INVALID_TRANSITION", "업무 진행 순서를 확인해주세요.");
+  const next = status === "todo" && branch ? "in_progress" : status;
+  if (next !== "todo" && !branch.trim())
+    fail(400, "BRANCH_REQUIRED", "작업 브랜치를 연결해주세요.");
+  if (
+    ["done", "released"].includes(next) &&
+    (!summary.trim() || !/^[a-f0-9]{7,40}$/i.test(commit))
+  )
+    fail(400, "RESULT_REQUIRED", "개발 결과와 병합 커밋을 기록해주세요.");
+  if (next === "released" && !deployment)
+    fail(
+      400,
+      "DEPLOYMENT_REQUIRED",
+      "실제 배포 성공을 확인할 수 있는 링크를 입력해주세요.",
+    );
+  return next;
+}
 @Injectable()
 export class ProjectWorkService {
   constructor(
     private readonly database: DatabaseService,
     private readonly requests: RequestsService,
   ) {}
+  private run<T>(fn: (tx: Tx) => Promise<T>, existingTx?: Tx) {
+    return existingTx ? fn(existingTx) : this.database.db.transaction(fn);
+  }
   private async access(tx: Tx, u: User, pid: string, lock = false) {
     const access = await this.requests.access(tx, u, pid, lock);
     if (!access.canManage)
@@ -89,16 +145,14 @@ export class ProjectWorkService {
     kind: string,
     title: string,
   ) {
-    await tx
-      .insert(activity)
-      .values({
-        projectId: pid,
-        entityId: id,
-        kind,
-        body: title,
-        actorId: u.id,
-        createdAt: sql`clock_timestamp()`,
-      });
+    await tx.insert(activity).values({
+      projectId: pid,
+      entityId: id,
+      kind,
+      body: title,
+      actorId: u.id,
+      createdAt: sql`clock_timestamp()`,
+    });
   }
   private async links(
     tx: Tx,
@@ -166,6 +220,23 @@ export class ProjectWorkService {
       .where(eq(taskRequests.taskId, row.id));
     return {
       ...row,
+      resultEntries: await tx
+        .select({ entry: taskResultEntries, actorName: users.displayName })
+        .from(taskResultEntries)
+        .innerJoin(users, eq(users.id, taskResultEntries.actorId))
+        .where(eq(taskResultEntries.taskId, row.id))
+        .orderBy(desc(taskResultEntries.createdAt)),
+      documentVersions: await tx
+        .select({
+          id: documentVersions.id,
+          documentId: documentVersions.documentId,
+          title: documentVersions.title,
+          changeSummary: documentVersions.changeSummary,
+          createdAt: documentVersions.createdAt,
+        })
+        .from(documentVersions)
+        .where(eq(documentVersions.taskId, row.id))
+        .orderBy(desc(documentVersions.createdAt)),
       assignees,
       requests,
       assigneeIds: assignees.map((x) => x.userId),
@@ -190,9 +261,13 @@ export class ProjectWorkService {
     pid: string,
     b: Record<string, unknown>,
     id?: string,
+    gitEvent?: GitEvent,
+    existingTx?: Tx,
   ) {
-    return this.database.db.transaction(async (tx) => {
+    return this.run(async (tx) => {
       await this.access(tx, u, pid, true);
+      if (!b || typeof b !== "object" || Array.isArray(b))
+        fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       let old: typeof tasks.$inferSelect | undefined;
       if (id) {
         [old] = await tx
@@ -202,6 +277,30 @@ export class ProjectWorkService {
           .for("update");
         if (!old) fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
       }
+      if (
+        old &&
+        b.expectedVersion !== undefined &&
+        b.expectedVersion !== old.version
+      )
+        fail(
+          409,
+          "TASK_CHANGED",
+          "다른 작업으로 업무가 변경되었습니다. 최신 내용을 다시 열어 확인해주세요.",
+        );
+      if (
+        gitEvent &&
+        old &&
+        (old.repositoryUrl !== gitEvent.repository ||
+          old.liveBranch !== gitEvent.branch ||
+          (gitEvent.kind === "merge"
+            ? old.status !== "in_progress" ||
+              old.workBranch !== gitEvent.workBranch
+            : old.status !== "done" ||
+              ![gitEvent.commit, ...(gitEvent.includedCommits ?? [])].includes(
+                old.mergeCommit,
+              )))
+      )
+        return { task: await this.taskOutput(tx, old), ignored: true };
       const current = old ? await this.taskOutput(tx, old) : undefined;
       const title = bounded(b?.title ?? old?.title, 160),
         description = bounded(
@@ -213,6 +312,7 @@ export class ProjectWorkService {
           "todo",
           "in_progress",
           "done",
+          "released",
         ]),
         priority = choice(b?.priority ?? old?.priority ?? "normal", [
           "urgent",
@@ -226,7 +326,253 @@ export class ProjectWorkService {
         assigneeIds = ids(b?.assigneeIds ?? current?.assigneeIds ?? []),
         requestIds = ids(b?.requestIds ?? current?.requestIds ?? []);
       await this.links(tx, pid, assigneeIds, requestIds);
-      const values = { title, description, status, priority, dueDate: due };
+      const metadata = {
+        repositoryUrl: documentUrl(
+          b.repositoryUrl === undefined
+            ? (old?.repositoryUrl ?? null)
+            : b.repositoryUrl,
+        ),
+        workBranch: bounded(b.workBranch ?? old?.workBranch ?? "", 200, false),
+        liveBranch: bounded(b.liveBranch ?? old?.liveBranch ?? "main", 200),
+        pullRequestUrl: documentUrl(
+          b.pullRequestUrl === undefined
+            ? (old?.pullRequestUrl ?? null)
+            : b.pullRequestUrl,
+        ),
+        mergeCommit: bounded(
+          b.mergeCommit ?? old?.mergeCommit ?? "",
+          40,
+          false,
+        ),
+        deploymentUrl: documentUrl(
+          b.deploymentUrl === undefined
+            ? (old?.deploymentUrl ?? null)
+            : b.deploymentUrl,
+        ),
+        resultSummary: bounded(
+          b.resultSummary ?? old?.resultSummary ?? "",
+          10000,
+          false,
+        ),
+        dbChanges: bounded(b.dbChanges ?? old?.dbChanges ?? "", 10000, false),
+        apiChanges: bounded(
+          b.apiChanges ?? old?.apiChanges ?? "",
+          10000,
+          false,
+        ),
+        frontendChanges: bounded(
+          b.frontendChanges ?? old?.frontendChanges ?? "",
+          10000,
+          false,
+        ),
+        verification: bounded(
+          b.verification ?? old?.verification ?? "",
+          10000,
+          false,
+        ),
+      };
+      if (
+        old &&
+        old.workBranch &&
+        (metadata.workBranch !== old.workBranch ||
+          metadata.repositoryUrl !== old.repositoryUrl ||
+          metadata.liveBranch !== old.liveBranch)
+      ) {
+        if (status !== "in_progress")
+          fail(
+            400,
+            "INVALID_TRANSITION",
+            "새 브랜치 작업은 진행 중 상태로 시작해주세요.",
+          );
+        metadata.mergeCommit = "";
+        metadata.deploymentUrl = null;
+        metadata.pullRequestUrl = null;
+      }
+      if (
+        (metadata.workBranch !== (old?.workBranch ?? "") ||
+          metadata.repositoryUrl !== (old?.repositoryUrl ?? null) ||
+          metadata.liveBranch !== (old?.liveBranch ?? "main")) &&
+        metadata.workBranch &&
+        !assigneeIds.includes(u.id)
+      )
+        fail(
+          403,
+          "ASSIGNEE_REQUIRED",
+          "배정된 개발 담당자가 작업 브랜치를 연결할 수 있습니다.",
+        );
+      if (
+        metadata.workBranch &&
+        (!metadata.repositoryUrl || !assigneeIds.length)
+      )
+        fail(400, "BRANCH_REQUIRED", "저장소와 개발 담당자를 지정해주세요.");
+      if (
+        metadata.workBranch &&
+        (!/^(?!.*(?:\.\.|@\{|[~^:?*\\\s]))(?![/.])(?!.*[/.]$).+$/.test(
+          metadata.workBranch,
+        ) ||
+          metadata.workBranch === metadata.liveBranch)
+      )
+        fail(
+          400,
+          "INVALID_BRANCH",
+          "라이브 브랜치와 다른 유효한 작업 브랜치를 입력해주세요.",
+        );
+      const nextStatus = taskLifecycle(
+        old?.status ?? "todo",
+        status,
+        metadata.workBranch,
+        metadata.resultSummary,
+        metadata.mergeCommit,
+        metadata.deploymentUrl,
+      );
+      if (
+        b.mergeApprovalRequired !== undefined &&
+        typeof b.mergeApprovalRequired !== "boolean"
+      )
+        fail(400, "VALIDATION_ERROR", "병합 승인 필요 여부를 확인해주세요.");
+      const mergeApprovalRequired = (b.mergeApprovalRequired ??
+        old?.mergeApprovalRequired ??
+        false) as boolean;
+      const mergeReviewerId =
+        b.mergeReviewerId === undefined
+          ? (old?.mergeReviewerId ?? null)
+          : b.mergeReviewerId === null || b.mergeReviewerId === ""
+            ? null
+            : uuid(b.mergeReviewerId).toLowerCase();
+      const policyChanged =
+        mergeApprovalRequired !== (old?.mergeApprovalRequired ?? false) ||
+        mergeReviewerId !== (old?.mergeReviewerId ?? null);
+      if (policyChanged) {
+        const permission = await this.requests.access(tx, u, pid);
+        if (!permission.canAssign)
+          fail(
+            403,
+            "FORBIDDEN",
+            "관리자만 병합 승인 필요 여부와 승인자를 변경할 수 있습니다.",
+          );
+        if (old && ["done", "released"].includes(old.status))
+          fail(
+            409,
+            "REOPEN_REQUIRED",
+            "완료된 업무는 먼저 진행 중으로 다시 열어주세요.",
+          );
+      }
+      if (mergeApprovalRequired && (policyChanged || !old))
+        await requireMergeReviewer(tx, pid, mergeReviewerId, assigneeIds);
+      const reviewChanged =
+        !!old &&
+        (policyChanged ||
+          [
+            "title",
+            "description",
+            "repositoryUrl",
+            "workBranch",
+            "liveBranch",
+            "pullRequestUrl",
+            "resultSummary",
+            "dbChanges",
+            "apiChanges",
+            "frontendChanges",
+            "verification",
+          ].some((key) => {
+            const next = { title, description, ...metadata } as Record<
+              string,
+              unknown
+            >;
+            return (
+              next[key] !== (old as unknown as Record<string, unknown>)[key]
+            );
+          }) ||
+          [...assigneeIds].sort().join() !==
+            [...(current?.assigneeIds ?? [])].sort().join() ||
+          [...requestIds].sort().join() !==
+            [...(current?.requestIds ?? [])].sort().join() ||
+          (["done", "released"].includes(old.status) &&
+            nextStatus === "in_progress"));
+      // Serialize policy edits and merge attempts even when another task links the same PR.
+      for (const url of [
+        ...new Set(
+          [old?.pullRequestUrl, metadata.pullRequestUrl].filter(
+            (v): v is string => !!v,
+          ),
+        ),
+      ].sort())
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${"bridgain-pr:" + url}, 0))`,
+        );
+      const reviewStatus = reviewChanged
+        ? "none"
+        : (old?.reviewStatus ?? "none");
+      if (
+        mergeApprovalRequired &&
+        nextStatus === "done" &&
+        (old?.status !== nextStatus || reviewChanged)
+      ) {
+        if (!old || reviewChanged)
+          return fail(
+            409,
+            "MERGE_APPROVAL_REQUIRED",
+            "변경 사항을 저장하고 다시 검토를 요청해주세요.",
+          );
+        await requireMergeReviewer(
+          tx,
+          pid,
+          mergeReviewerId,
+          assigneeIds,
+          old.reviewRequestedBy,
+        );
+        if (
+          !gitEvent ||
+          gitEvent.kind !== "merge" ||
+          gitEvent.url !== old.pullRequestUrl
+        )
+          return fail(
+            409,
+            "MERGE_REQUIRED",
+            "승인 후 업무의 병합 버튼으로 실제 PR을 병합해주세요.",
+          );
+        requireApprovedReview(old, gitEvent.headSha);
+      }
+      if (
+        old?.mergeApprovalRequired &&
+        ["done", "released"].includes(old.status) &&
+        nextStatus !== "in_progress" &&
+        (reviewChanged || metadata.mergeCommit !== old.mergeCommit)
+      )
+        fail(
+          409,
+          "REOPEN_REQUIRED",
+          "승인된 개발 결과를 변경하려면 업무를 진행 중으로 다시 열어주세요.",
+        );
+      if (old && reviewChanged && old.reviewStatus !== "none")
+        await tx.insert(taskReviewEvents).values({
+          taskId: old.id,
+          actorId: u.id,
+          action: "invalidated",
+          headSha: old.reviewHeadSha,
+          baseSha: old.reviewBaseSha,
+          note: "업무 내용·담당자·승인 정책 또는 Git 연결 변경으로 검토가 초기화되었습니다.",
+        });
+      const values = {
+        version: randomUUID(),
+        mergeApprovalRequired,
+        mergeReviewerId,
+        reviewStatus,
+        ...(reviewChanged
+          ? {
+              reviewHeadSha: "",
+              reviewBaseSha: "",
+              reviewRequestedBy: null,
+              reviewRequestId: null,
+            }
+          : {}),
+        title,
+        description,
+        status: nextStatus,
+        priority,
+        dueDate: due,
+        ...metadata,
+      };
       const [row] = old
         ? await tx
             .update(tasks)
@@ -257,18 +603,117 @@ export class ProjectWorkService {
         old ? "task_updated" : "task_created",
         title,
       );
+      await this.syncRequests(tx, u, pid, [
+        ...new Set([...requestIds, ...(current?.requestIds ?? [])]),
+      ]);
       return { task: await this.taskOutput(tx, row) };
+    }, existingTx).catch((error: unknown) => {
+      const wrapped = error as {
+        code?: string;
+        constraint?: string;
+        cause?: { code?: string; constraint?: string };
+      };
+      const detail = wrapped?.cause ?? wrapped;
+      if (
+        detail?.code === "23505" &&
+        detail.constraint === "task_approval_pr_unique"
+      )
+        fail(
+          409,
+          "PR_ALREADY_LINKED",
+          "이 PR은 이미 승인 필수 업무에 연결되어 있습니다.",
+        );
+      throw error;
     });
+  }
+  async listResultEntries(u: User, pid: string, id: string) {
+    return this.database.db.transaction(async (tx) => {
+      await this.access(tx, u, pid);
+      const [task] = await tx
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.id, uuid(id)), eq(tasks.projectId, pid)));
+      if (!task) fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
+      return {
+        entries: await tx
+          .select({ entry: taskResultEntries, actorName: users.displayName })
+          .from(taskResultEntries)
+          .innerJoin(users, eq(users.id, taskResultEntries.actorId))
+          .where(eq(taskResultEntries.taskId, id))
+          .orderBy(desc(taskResultEntries.createdAt)),
+      };
+    });
+  }
+  async appendResult(
+    u: User,
+    pid: string,
+    id: string,
+    b: Record<string, unknown>,
+    existingTx?: Tx,
+  ) {
+    if (!b || typeof b !== "object" || Array.isArray(b))
+      fail(400, "VALIDATION_ERROR", "추가할 기록을 확인해주세요.");
+    return this.run(async (tx) => {
+      await this.access(tx, u, pid, true);
+      const [task] = await tx
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.id, uuid(id)), eq(tasks.projectId, pid)))
+        .for("update");
+      if (!task) return fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
+      if (b.expectedVersion !== task.version)
+        fail(
+          409,
+          "TASK_CHANGED",
+          "업무가 변경되었습니다. 최신 업무를 확인하고 기록을 추가해주세요.",
+        );
+      if (!["done", "released"].includes(task.status))
+        fail(
+          409,
+          "TASK_NOT_COMPLETED",
+          "완료된 업무에 후속 기록을 추가할 수 있습니다.",
+        );
+      const values = {
+        changeSummary: bounded(b.changeSummary, 1000),
+        resultSummary: bounded(b.resultSummary ?? "", 10000, false),
+        dbChanges: bounded(b.dbChanges ?? "", 10000, false),
+        apiChanges: bounded(b.apiChanges ?? "", 10000, false),
+        frontendChanges: bounded(b.frontendChanges ?? "", 10000, false),
+        verification: bounded(b.verification ?? "", 10000, false),
+      };
+      const [entry] = await tx
+        .insert(taskResultEntries)
+        .values({ ...values, taskId: id, actorId: u.id })
+        .returning();
+      await this.event(
+        tx,
+        u,
+        pid,
+        id,
+        "task_result_added",
+        values.changeSummary,
+      );
+      return { entry };
+    }, existingTx);
   }
   async listMeetings(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
       await this.access(tx, u, pid);
+      const rows = await tx
+        .select()
+        .from(meetings)
+        .where(eq(meetings.projectId, pid))
+        .orderBy(desc(meetings.scheduledAt));
       return {
-        meetings: await tx
-          .select()
-          .from(meetings)
-          .where(eq(meetings.projectId, pid))
-          .orderBy(desc(meetings.scheduledAt)),
+        meetings: await Promise.all(
+          rows.map(async (row) => ({
+            ...row,
+            requests: await tx
+              .select()
+              .from(meetingRequests)
+              .where(eq(meetingRequests.meetingId, row.id)),
+          })),
+        ),
       };
     });
   }
@@ -277,9 +722,12 @@ export class ProjectWorkService {
     pid: string,
     b: Record<string, unknown>,
     id?: string,
+    existingTx?: Tx,
   ) {
-    return this.database.db.transaction(async (tx) => {
+    return this.run(async (tx) => {
       await this.access(tx, u, pid, true);
+      if (!b || typeof b !== "object" || Array.isArray(b))
+        fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       let old: typeof meetings.$inferSelect | undefined;
       if (id) {
         [old] = await tx
@@ -288,6 +736,96 @@ export class ProjectWorkService {
           .where(and(eq(meetings.id, uuid(id)), eq(meetings.projectId, pid)))
           .for("update");
         if (!old) fail(404, "NOT_FOUND", "회의를 찾을 수 없습니다.");
+      }
+      if (old?.decisionStatus === "final") {
+        if (
+          b.status !== "completed" ||
+          Object.keys(b).some((key) => key !== "status")
+        )
+          fail(
+            409,
+            "MEETING_FINAL",
+            "최종안 내용은 수정할 수 없습니다. 회의 완료 처리만 가능합니다.",
+          );
+        if (old.status !== "completed") {
+          await tx
+            .update(meetings)
+            .set({ status: "completed", updatedAt: sql`clock_timestamp()` })
+            .where(eq(meetings.id, old.id));
+          await this.event(tx, u, pid, old.id, "meeting_completed", old.title);
+        }
+        return {
+          meeting: {
+            ...old,
+            status: "completed",
+            requests: await tx
+              .select()
+              .from(meetingRequests)
+              .where(eq(meetingRequests.meetingId, old.id)),
+          },
+        };
+      }
+      const decisionStatus = choice(
+        b.decisionStatus ?? old?.decisionStatus ?? "draft",
+        ["draft", "final"],
+      );
+      const previous = old
+        ? await tx
+            .select()
+            .from(meetingRequests)
+            .where(eq(meetingRequests.meetingId, old.id))
+        : [];
+      const source =
+        b.requests ??
+        (previous.length
+          ? previous
+          : (b.requestId ?? old?.requestId)
+            ? [{ requestId: b.requestId ?? old?.requestId }]
+            : []);
+      if (!Array.isArray(source) || source.length > 50)
+        fail(400, "VALIDATION_ERROR", "회의 요청은 최대 50개입니다.");
+      const plans = (source as Record<string, unknown>[]).map((item) => {
+        if (!item || typeof item !== "object")
+          fail(400, "VALIDATION_ERROR", "요청 메모를 확인해주세요.");
+        return {
+          requestId: uuid(item.requestId).toLowerCase(),
+          planning: bounded(item.planning ?? "", 10000, false),
+          uiNotes: bounded(item.uiNotes ?? "", 10000, false),
+          apiNotes: bounded(item.apiNotes ?? "", 10000, false),
+          dbNotes: bounded(item.dbNotes ?? "", 10000, false),
+          priority: choice(item.priority ?? "normal", [
+            "urgent",
+            "high",
+            "normal",
+            "low",
+          ]),
+          assigneeIds: ids(item.assigneeIds ?? []),
+        };
+      });
+      if (new Set(plans.map((x) => x.requestId)).size !== plans.length)
+        fail(400, "VALIDATION_ERROR", "같은 요청을 중복 연결할 수 없습니다.");
+      if (decisionStatus === "final" && !plans.length)
+        fail(400, "VALIDATION_ERROR", "최종안에는 고객 요청을 연결해주세요.");
+      for (const plan of plans) {
+        await this.links(tx, pid, plan.assigneeIds, [plan.requestId]);
+        if (
+          decisionStatus === "draft" &&
+          (plan.assigneeIds.length || plan.priority !== "normal")
+        )
+          fail(
+            400,
+            "MEETING_DRAFT",
+            "최종안에서만 개발 담당자를 할당할 수 있습니다.",
+          );
+        if (
+          decisionStatus === "final" &&
+          (!plan.assigneeIds.length || !plan.planning.trim())
+        )
+          fail(
+            400,
+            "ASSIGNMENT_REQUIRED",
+            "요청별 기획과 개발 담당자를 입력해주세요.",
+          );
       }
       const duration = b?.durationMinutes ?? old?.durationMinutes ?? 60;
       if (
@@ -310,6 +848,7 @@ export class ProjectWorkService {
           b?.scheduledAt ?? old?.scheduledAt.toISOString(),
         ),
         durationMinutes: duration as number,
+        decisionStatus,
         location: bounded(b?.location ?? old?.location ?? "", 1000, false),
         notes: bounded(b?.notes ?? old?.notes ?? "", 20000, false),
         status: choice(b?.status ?? old?.status ?? "scheduled", [
@@ -336,8 +875,66 @@ export class ProjectWorkService {
         old ? "meeting_updated" : "meeting_created",
         row.title,
       );
-      return { meeting: row };
-    });
+      if (old)
+        await tx
+          .delete(meetingRequests)
+          .where(eq(meetingRequests.meetingId, row.id));
+      for (const plan of plans) {
+        let taskId: string | null = null;
+        if (decisionStatus === "final") {
+          const [request] = await tx
+            .select()
+            .from(projectRequests)
+            .where(eq(projectRequests.id, plan.requestId));
+          const [task] = await tx
+            .insert(tasks)
+            .values({
+              projectId: pid,
+              title: request.title,
+              description: [
+                plan.planning,
+                plan.uiNotes && `UI: ${plan.uiNotes}`,
+                plan.apiNotes && `API: ${plan.apiNotes}`,
+                plan.dbNotes && `DB: ${plan.dbNotes}`,
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+              priority: plan.priority,
+              createdBy: u.id,
+            })
+            .returning();
+          taskId = task.id;
+          await tx
+            .insert(taskRequests)
+            .values({ taskId, requestId: plan.requestId });
+          await tx
+            .insert(taskAssignees)
+            .values(
+              plan.assigneeIds.map((userId) => ({ taskId: task.id, userId })),
+            );
+          await this.event(tx, u, pid, task.id, "task_created", task.title);
+        }
+        await tx
+          .insert(meetingRequests)
+          .values({ ...plan, meetingId: row.id, taskId });
+      }
+      if (decisionStatus === "final")
+        await this.syncRequests(
+          tx,
+          u,
+          pid,
+          plans.map((plan) => plan.requestId),
+        );
+      return {
+        meeting: {
+          ...row,
+          requests: await tx
+            .select()
+            .from(meetingRequests)
+            .where(eq(meetingRequests.meetingId, row.id)),
+        },
+      };
+    }, existingTx);
   }
   async listDocuments(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
@@ -349,10 +946,28 @@ export class ProjectWorkService {
         .where(eq(documents.projectId, pid))
         .orderBy(desc(documents.updatedAt));
       return {
-        documents: rows.map((x) => ({
-          ...x.document,
-          creatorName: x.creatorName,
-        })),
+        documents: await Promise.all(
+          rows.map(async (x) => ({
+            ...x.document,
+            creatorName: x.creatorName,
+            versions: await tx
+              .select({
+                id: documentVersions.id,
+                title: documentVersions.title,
+                category: documentVersions.category,
+                content: documentVersions.content,
+                url: documentVersions.url,
+                changeSummary: documentVersions.changeSummary,
+                taskId: documentVersions.taskId,
+                actorName: users.displayName,
+                createdAt: documentVersions.createdAt,
+              })
+              .from(documentVersions)
+              .innerJoin(users, eq(users.id, documentVersions.actorId))
+              .where(eq(documentVersions.documentId, x.document.id))
+              .orderBy(desc(documentVersions.createdAt)),
+          })),
+        ),
       };
     });
   }
@@ -361,9 +976,12 @@ export class ProjectWorkService {
     pid: string,
     b: Record<string, unknown>,
     id?: string,
+    existingTx?: Tx,
   ) {
-    return this.database.db.transaction(async (tx) => {
+    return this.run(async (tx) => {
       await this.access(tx, u, pid, true);
+      if (!b || typeof b !== "object" || Array.isArray(b))
+        fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       let old: typeof documents.$inferSelect | undefined;
       if (id) {
         [old] = await tx
@@ -373,6 +991,19 @@ export class ProjectWorkService {
           .for("update");
         if (!old) fail(404, "NOT_FOUND", "문서를 찾을 수 없습니다.");
       }
+      const taskId = b.taskId ? uuid(b.taskId) : null;
+      if (taskId) {
+        const [task] = await tx
+          .select()
+          .from(tasks)
+          .where(and(eq(tasks.id, taskId), eq(tasks.projectId, pid)));
+        if (!task)
+          fail(400, "INVALID_TASK", "같은 프로젝트의 업무를 연결해주세요.");
+      }
+      const changeSummary = bounded(
+        b.changeSummary ?? (old ? "" : "최초 작성"),
+        1000,
+      );
       const values = {
         title: bounded(b?.title ?? old?.title, 160),
         category: choice(b?.category ?? old?.category ?? "other", [
@@ -380,6 +1011,8 @@ export class ProjectWorkService {
           "design",
           "api",
           "meeting",
+          "erd",
+          "frontend",
           "other",
         ]),
         content: bounded(b?.content ?? old?.content ?? "", 50000, false),
@@ -403,12 +1036,158 @@ export class ProjectWorkService {
         old ? "document_updated" : "document_created",
         row.title,
       );
+      if (old) {
+        const existing = await tx
+          .select({ id: documentVersions.id })
+          .from(documentVersions)
+          .where(eq(documentVersions.documentId, old.id))
+          .limit(1);
+        if (!existing.length)
+          await tx.insert(documentVersions).values({
+            documentId: old.id,
+            title: old.title,
+            category: old.category,
+            content: old.content,
+            url: old.url,
+            changeSummary: "이력 도입 이전 버전",
+            actorId: old.createdBy,
+            createdAt: old.updatedAt,
+          });
+      }
+      await tx.insert(documentVersions).values({
+        documentId: row.id,
+        ...values,
+        changeSummary,
+        taskId,
+        actorId: u.id,
+        createdAt: sql`clock_timestamp()`,
+      });
       const [creator] = await tx
         .select({ name: users.displayName })
         .from(users)
         .where(eq(users.id, row.createdBy));
       return { document: { ...row, creatorName: creator.name } };
-    });
+    }, existingTx);
+  }
+  async applyGitEvent(event: GitEvent) {
+    if (!/^[a-f0-9]{40}$/i.test(event.commit))
+      fail(400, "INVALID_COMMIT", "커밋을 확인해주세요.");
+    const link = documentUrl(event.url);
+    const rows = await this.database.db
+      .select()
+      .from(tasks)
+      .where(eq(tasks.repositoryUrl, event.repository));
+    let updated = 0;
+    const failed: { taskId: string; code: string }[] = [];
+    for (const task of rows) {
+      if (task.liveBranch !== event.branch) continue;
+      if (
+        event.kind === "merge" &&
+        (task.workBranch !== event.workBranch || task.status !== "in_progress")
+      )
+        continue;
+      if (
+        event.kind === "deployment" &&
+        (![event.commit, ...(event.includedCommits ?? [])].includes(
+          task.mergeCommit,
+        ) ||
+          task.status !== "done")
+      )
+        continue;
+      if (!task.resultSummary.trim()) continue;
+      const [member] = await this.database.db
+        .select({
+          id: users.id,
+          displayName: users.displayName,
+          accountType: users.accountType,
+        })
+        .from(taskAssignees)
+        .innerJoin(users, eq(users.id, taskAssignees.userId))
+        .where(
+          and(
+            eq(taskAssignees.taskId, task.id),
+            eq(users.accountType, "team"),
+            eq(users.status, "active"),
+          ),
+        );
+      if (!member) continue;
+      try {
+        const result = await this.saveTask(
+          member,
+          task.projectId,
+          event.kind === "merge"
+            ? {
+                status: "done",
+                mergeCommit: event.commit,
+                pullRequestUrl: link,
+              }
+            : { status: "released", deploymentUrl: link },
+          task.id,
+          event,
+        );
+        if (!result.ignored) updated++;
+      } catch (error) {
+        // A rejected task must not block other tasks; infrastructure failures still trigger webhook retry.
+        const status = (error as { getStatus?: () => number }).getStatus?.();
+        if (status && status >= 400 && status < 500) {
+          const response = (
+            error as { getResponse?: () => unknown }
+          ).getResponse?.();
+          const code =
+            response && typeof response === "object" && "code" in response
+              ? String(response.code)
+              : "TASK_SYNC_REJECTED";
+          failed.push({ taskId: task.id, code });
+          await this.database.db.transaction((tx) =>
+            this.event(
+              tx,
+              member,
+              task.projectId,
+              task.id,
+              "git_sync_failed",
+              `Git 상태 반영 실패: ${code}. 업무 상태와 승인 정보를 확인해주세요.`,
+            ),
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
+    return { updated, failed };
+  }
+  private async syncRequests(
+    tx: Tx,
+    u: User,
+    pid: string,
+    requestIds: string[],
+  ) {
+    for (const rid of requestIds) {
+      const linked = await tx
+        .select({ status: tasks.status })
+        .from(taskRequests)
+        .innerJoin(tasks, eq(tasks.id, taskRequests.taskId))
+        .where(eq(taskRequests.requestId, rid));
+      const status = requestProgress(linked.map((t) => t.status));
+      const [request] = await tx
+        .select()
+        .from(projectRequests)
+        .where(
+          and(eq(projectRequests.id, rid), eq(projectRequests.projectId, pid)),
+        );
+      if (request && request.status !== status) {
+        await tx
+          .update(projectRequests)
+          .set({ status, updatedAt: sql`clock_timestamp()` })
+          .where(eq(projectRequests.id, rid));
+        await tx.insert(requestEvents).values({
+          requestId: rid,
+          actorId: u.id,
+          kind: "status",
+          status,
+          body: "연결된 개발 업무의 진행 상태 반영",
+        });
+      }
+    }
   }
   async listActivity(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {

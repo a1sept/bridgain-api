@@ -4,3 +4,5 @@ export * from "./workspace.js";
 
 export * from "./requests.js";
 export * from "./project-work.js";
+
+export * from "./ai.js";

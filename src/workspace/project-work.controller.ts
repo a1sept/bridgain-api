@@ -1,3 +1,5 @@
+import { fail } from "../auth/security.js";
+import { TaskReviewService } from "./task-review.service.js";
 import {
   Controller,
   Get,
@@ -16,6 +18,7 @@ export class ProjectWorkController {
   constructor(
     private readonly workspace: WorkspaceController,
     private readonly work: ProjectWorkService,
+    private readonly reviews: TaskReviewService,
   ) {}
   @Get("tasks") async tasks(
     @Req() req: Request,
@@ -43,11 +46,57 @@ export class ProjectWorkController {
     @Param("id") id: string,
     @Body() b: Record<string, unknown>,
   ) {
-    return this.work.saveTask(
+    const user = await this.workspace.user(req, res, true);
+    if (typeof b?.expectedVersion !== "string")
+      fail(409, "TASK_VERSION_REQUIRED", "최신 업무를 다시 열어 저장해주세요.");
+    return this.work.saveTask(user, pid, b, id);
+  }
+  @Get("tasks/:id/result-entries") async resultEntries(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string,
+    @Param("id") id: string,
+  ) {
+    return this.work.listResultEntries(
+      await this.workspace.user(req, res),
+      pid,
+      id,
+    );
+  }
+  @Post("tasks/:id/result-entries") async appendResult(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string,
+    @Param("id") id: string,
+    @Body() b: Record<string, unknown>,
+  ) {
+    return this.work.appendResult(
       await this.workspace.user(req, res, true),
       pid,
-      b,
       id,
+      b,
+    );
+  }
+  @Get("tasks/:id/review") async reviewHistory(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string,
+    @Param("id") id: string,
+  ) {
+    return this.reviews.history(await this.workspace.user(req, res), pid, id);
+  }
+  @Post("tasks/:id/review") async review(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string,
+    @Param("id") id: string,
+    @Body() b: Record<string, unknown>,
+  ) {
+    return this.reviews.act(
+      await this.workspace.user(req, res, true),
+      pid,
+      id,
+      b,
     );
   }
   @Get("meetings") async meetings(
