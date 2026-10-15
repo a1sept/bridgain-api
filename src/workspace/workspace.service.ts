@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { projectRepositories } from "./project-repositories.js";
 import { projectTasks, taskReviewEvents } from "../db/schema/project-work.js";
 import { Injectable } from "@nestjs/common";
 import { and, asc, eq, ilike, inArray, ne, or } from "drizzle-orm";
@@ -177,8 +178,9 @@ export class WorkspaceService {
           .filter((m) => m.m.teamId === t.id)
           .map((m) => member(m.u, t.id, null)),
       })),
-      projects: ps.map((p) => ({
+      projects: ps.map(({ repositoryUrls, ...p }) => ({
         ...p,
+        ...(u.accountType === "team" ? { repositoryUrls } : {}),
         canManage: u.accountType === "team" && adminIds.includes(p.teamId),
         members: pms
           .filter((m) => m.m.projectId === p.id)
@@ -248,6 +250,7 @@ export class WorkspaceService {
     this.teamUser(u);
     const name = bounded(body?.name, 120);
     const description = bounded(body?.description ?? "", 2000, false);
+    const repositoryUrls = projectRepositories(body?.repositoryUrls ?? []);
     const requested =
       body?.teamId === undefined ? undefined : uuid(body.teamId);
     const rawInvitees = body?.inviteeIds === undefined ? [] : body.inviteeIds;
@@ -309,7 +312,7 @@ export class WorkspaceService {
       }
       const [p] = await tx
         .insert(projects)
-        .values({ name, description, teamId, createdBy: u.id })
+        .values({ name, description, repositoryUrls, teamId, createdBy: u.id })
         .returning();
       await tx
         .insert(pm)
@@ -326,7 +329,10 @@ export class WorkspaceService {
     });
   }
   async update(u: User, id: string, body: Record<string, unknown>) {
+    this.teamUser(u);
     const patch: Partial<typeof projects.$inferInsert> = {};
+    if (body?.repositoryUrls !== undefined)
+      patch.repositoryUrls = projectRepositories(body.repositoryUrls);
     if (body?.name !== undefined) patch.name = bounded(body.name, 120);
     if (body?.description !== undefined)
       patch.description = bounded(body.description, 2000, false);

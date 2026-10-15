@@ -1,0 +1,1 @@
+ALTER TABLE "projects" ADD COLUMN "repository_urls" text[] DEFAULT '{}'::text[] NOT NULL;
