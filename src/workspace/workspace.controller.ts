@@ -1,3 +1,6 @@
+import { repositoryRelations } from "./submodules.js";
+import { GithubConnectionService } from "./github-connection.service.js";
+import { projectRepositories } from "./project-repositories.js";
 import {
   Body,
   Controller,
@@ -11,6 +14,7 @@ import {
 } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { AuthService } from "../auth/auth.service.js";
+import { allowsOrigin } from "../auth/origins.js";
 import { AppKind, cookies, equal, fail } from "../auth/security.js";
 import { WorkspaceService } from "./workspace.service.js";
 @Controller("workspace")
@@ -18,6 +22,7 @@ export class WorkspaceController {
   constructor(
     private readonly auth: AuthService,
     private readonly workspace: WorkspaceService,
+    private readonly github: GithubConnectionService,
   ) {}
   async user(req: Request, res: Response, mutation = false) {
     const secret = process.env.AUTH_PROXY_SECRET;
@@ -33,7 +38,7 @@ export class WorkspaceController {
     if (mutation) {
       const csrf = jar[`bridgain_${app}_csrf`];
       if (
-        req.get("origin") !== this.auth.origin(app) ||
+        !allowsOrigin(app, req.get("origin"), this.auth.origin(app)) ||
         !csrf ||
         !/^[a-f0-9]{64}$/.test(csrf) ||
         !equal(csrf, req.get("x-csrf-token") ?? "")
@@ -73,7 +78,20 @@ export class WorkspaceController {
     @Res({ passthrough: true }) res: Response,
     @Body() body: Record<string, unknown>,
   ) {
-    return this.workspace.create(await this.user(req, res, true), body);
+    const user = await this.user(req, res, true);
+    await this.github.verify(
+      user.id,
+      projectRepositories(body.repositoryUrls ?? []),
+    );
+    const relations = repositoryRelations(
+      body.repositoryRelations ?? [],
+      projectRepositories(body.repositoryUrls ?? []),
+    );
+    if (relations.length) await this.github.verifyRelations(user.id, relations);
+    return this.workspace.create(user, {
+      ...body,
+      repositoryRelations: relations,
+    });
   }
   @Patch("projects/:id") async update(
     @Req() req: Request,
@@ -81,7 +99,24 @@ export class WorkspaceController {
     @Param("id") id: string,
     @Body() body: Record<string, unknown>,
   ) {
-    return this.workspace.update(await this.user(req, res, true), id, body);
+    const user = await this.user(req, res, true);
+    if (body.repositoryUrls !== undefined)
+      await this.github.verify(
+        user.id,
+        projectRepositories(body.repositoryUrls),
+      );
+    if (body.repositoryRelations !== undefined) {
+      if (body.repositoryUrls === undefined)
+        fail(400, "VALIDATION_ERROR", "저장소 목록도 함께 보내주세요.");
+      const relations = repositoryRelations(
+        body.repositoryRelations,
+        projectRepositories(body.repositoryUrls),
+      );
+      if (relations.length)
+        await this.github.verifyRelations(user.id, relations);
+      body = { ...body, repositoryRelations: relations };
+    }
+    return this.workspace.update(user, id, body);
   }
   @Post("projects/:id/invitations") async invite(
     @Req() req: Request,

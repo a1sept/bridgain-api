@@ -9,6 +9,7 @@ import {
 } from "@nestjs/common";
 import type { Request, Response, CookieOptions } from "express";
 import { AuthService } from "./auth.service.js";
+import { allowsOrigin } from "./origins.js";
 import {
   AppKind,
   cookies,
@@ -61,7 +62,7 @@ export class AuthController {
     const origin = req.get("origin");
     const csrf = cookies(req.get("cookie"))[this.name(app, "csrf")];
     if (
-      origin !== this.auth.origin(app) ||
+      !allowsOrigin(app, origin, this.auth.origin(app)) ||
       !csrf ||
       !/^[a-f0-9]{64}$/.test(csrf) ||
       !equal(csrf, req.get("x-csrf-token") ?? "")

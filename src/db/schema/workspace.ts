@@ -1,6 +1,8 @@
+import type { RepositoryRelation } from "../../workspace/submodules.js";
 import { sql } from "drizzle-orm";
 import {
   pgTable,
+  jsonb,
   boolean,
   uuid,
   text,
@@ -75,7 +77,14 @@ export const projects = pgTable(
       .references(() => teams.id),
     name: text("name").notNull(),
     description: text("description").notNull().default(""),
-    repositoryUrls: text("repository_urls").array().notNull().default(sql`'{}'::text[]`),
+    repositoryRelations: jsonb("repository_relations")
+      .$type<RepositoryRelation[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    repositoryUrls: text("repository_urls")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
     status: text("status").notNull().default("preparing"),
     createdBy: uuid("created_by")
       .notNull()

@@ -1,3 +1,4 @@
+import { repositoryRelations } from "./submodules.js";
 import { randomUUID } from "node:crypto";
 import { projectRepositories } from "./project-repositories.js";
 import { projectTasks, taskReviewEvents } from "../db/schema/project-work.js";
@@ -178,9 +179,11 @@ export class WorkspaceService {
           .filter((m) => m.m.teamId === t.id)
           .map((m) => member(m.u, t.id, null)),
       })),
-      projects: ps.map(({ repositoryUrls, ...p }) => ({
+      projects: ps.map(({ repositoryUrls, repositoryRelations, ...p }) => ({
         ...p,
-        ...(u.accountType === "team" ? { repositoryUrls } : {}),
+        ...(u.accountType === "team"
+          ? { repositoryUrls, repositoryRelations }
+          : {}),
         canManage: u.accountType === "team" && adminIds.includes(p.teamId),
         members: pms
           .filter((m) => m.m.projectId === p.id)
@@ -251,6 +254,10 @@ export class WorkspaceService {
     const name = bounded(body?.name, 120);
     const description = bounded(body?.description ?? "", 2000, false);
     const repositoryUrls = projectRepositories(body?.repositoryUrls ?? []);
+    const relations = repositoryRelations(
+      body.repositoryRelations ?? [],
+      repositoryUrls,
+    );
     const requested =
       body?.teamId === undefined ? undefined : uuid(body.teamId);
     const rawInvitees = body?.inviteeIds === undefined ? [] : body.inviteeIds;
@@ -312,7 +319,14 @@ export class WorkspaceService {
       }
       const [p] = await tx
         .insert(projects)
-        .values({ name, description, repositoryUrls, teamId, createdBy: u.id })
+        .values({
+          name,
+          description,
+          repositoryUrls,
+          repositoryRelations: relations,
+          teamId,
+          createdBy: u.id,
+        })
         .returning();
       await tx
         .insert(pm)
@@ -333,6 +347,14 @@ export class WorkspaceService {
     const patch: Partial<typeof projects.$inferInsert> = {};
     if (body?.repositoryUrls !== undefined)
       patch.repositoryUrls = projectRepositories(body.repositoryUrls);
+    if (body.repositoryRelations !== undefined) {
+      if (!patch.repositoryUrls)
+        fail(400, "VALIDATION_ERROR", "저장소 목록도 함께 보내주세요.");
+      patch.repositoryRelations = repositoryRelations(
+        body.repositoryRelations,
+        patch.repositoryUrls!,
+      );
+    }
     if (body?.name !== undefined) patch.name = bounded(body.name, 120);
     if (body?.description !== undefined)
       patch.description = bounded(body.description, 2000, false);
@@ -348,7 +370,17 @@ export class WorkspaceService {
     if (!Object.keys(patch).length)
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
-      await this.manager(tx, u, id);
+      const existing = await this.manager(tx, u, id);
+      if (patch.repositoryUrls && patch.repositoryRelations === undefined) {
+        const selected = new Set(
+          patch.repositoryUrls.map((url) => url.toLowerCase()),
+        );
+        patch.repositoryRelations = (existing.repositoryRelations ?? []).filter(
+          (r) =>
+            selected.has(r.parentUrl.toLowerCase()) &&
+            selected.has(r.childUrl.toLowerCase()),
+        );
+      }
       return (
         await tx
           .update(projects)

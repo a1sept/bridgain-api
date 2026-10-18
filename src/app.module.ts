@@ -1,3 +1,5 @@
+import { GithubConnectionController } from './workspace/github-connection.controller.js';
+import { GithubConnectionService } from './workspace/github-connection.service.js';
 import { TaskReviewService } from "./workspace/task-review.service.js";
 import { AiController } from "./workspace/ai.controller.js";
 import { AiService } from "./workspace/ai.service.js";
@@ -15,6 +17,7 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    GithubConnectionController,
     AiController,
     HealthController,
     AuthController,
@@ -24,6 +27,7 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    GithubConnectionService,
     AiService,
     DatabaseService,
     AuthService,

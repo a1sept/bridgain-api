@@ -1,0 +1,102 @@
+import { randomBytes } from "node:crypto";
+import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import type { Request, Response } from "express";
+import { WorkspaceController } from "./workspace.controller.js";
+import { GithubConnectionService } from "./github-connection.service.js";
+import { fail } from "../auth/security.js";
+@Controller("workspace/github")
+export class GithubConnectionController {
+  constructor(
+    private readonly workspace: WorkspaceController,
+    private readonly github: GithubConnectionService,
+  ) {}
+  private async user(req: Request, res: Response, mutation = false) {
+    const user = await this.workspace.user(req, res, mutation);
+    if (
+      req.get("x-bridgain-app") !== "developer" ||
+      user.accountType !== "team"
+    )
+      fail(403, "GITHUB_TEAM_REQUIRED", "개발자 팀 계정으로 연결해주세요.");
+    return user;
+  }
+  @Get("status") async status(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.github.status((await this.user(req, res)).id);
+  }
+  @Post("connect") async connect(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.github.connect((await this.user(req, res, true)).id);
+  }
+  @Get("callback") async callback(
+    @Req() req: Request,
+    @Res() res: Response,
+    @Query("state") state: unknown,
+    @Query("code") code: unknown,
+  ) {
+    const user = await this.user(req, res);
+    await this.github.callback(user.id, state, code);
+    const installationUrl = await this.github.installationUrlIfNeeded(user.id);
+    if (installationUrl) return res.redirect(installationUrl);
+    return this.completion(res);
+  }
+  @Get("callback/complete") async complete(
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const user = await this.user(req, res);
+    const installationUrl = await this.github.installationUrlIfNeeded(user.id);
+    if (installationUrl) return res.redirect(installationUrl);
+    return this.completion(res);
+  }
+  private completion(res: Response) {
+    const nonce = randomBytes(24).toString("base64");
+    res.setHeader(
+      "Content-Security-Policy",
+      `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'`,
+    );
+    res.setHeader("Referrer-Policy", "no-referrer");
+    return res.type("html").send(
+      `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub 연결 완료</title>
+<style nonce="${nonce}">body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#e8edf5;font:16px system-ui,sans-serif}main{max-width:420px;padding:32px;text-align:center}h1{font-size:24px}p{line-height:1.7;color:#b5c0cf}button{padding:12px 24px;border:0;border-radius:8px;background:#536dfe;color:white;font:inherit;cursor:pointer}</style></head>
+<body><main><h1>GitHub 연결 완료</h1><p>프로젝트 화면에 저장소 목록을 불러오고 있어요.<br>창이 자동으로 닫히지 않으면 아래 버튼으로 닫아주세요.</p><button id="close" type="button">프로젝트 화면으로 돌아가기</button></main>
+<script nonce="${nonce}">
+function finish() {
+  try { const channel = new BroadcastChannel('bridgain-github'); channel.postMessage({ type: 'connected' }); channel.close(); } catch {}
+  window.close();
+}
+document.getElementById('close').addEventListener('click', finish);
+finish();
+</script></body></html>`,
+    );
+  }
+  @Get("submodules") async submodules(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Query("repositoryUrl") repositoryUrl: unknown,
+  ) {
+    return this.github.submodules(
+      (await this.user(req, res)).id,
+      repositoryUrl,
+    );
+  }
+  @Get("repositories") async repositories(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return {
+      repositories: await this.github.repositories(
+        (await this.user(req, res)).id,
+      ),
+    };
+  }
+  @Post("disconnect") async disconnect(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.github.disconnect((await this.user(req, res, true)).id);
+  }
+}
