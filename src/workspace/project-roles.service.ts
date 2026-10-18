@@ -29,6 +29,8 @@ export const permissionCatalog = [
   ["tasks.progress", "배정된 업무 진행", "업무"],
   ["approvals.tasks", "업무화 승인", "승인"],
   ["approvals.merge", "병합 승인", "승인"],
+  ["approvals.work", "작업 승인", "승인"],
+  ["deploy.run", "배포하기", "배포"],
   ["members.manage", "참여자 관리", "관리"],
   ["roles.manage", "역할·권한 관리", "관리"],
   ["project.settings", "프로젝트 설정", "관리"],
@@ -45,7 +47,9 @@ export function normalizeProjectPermissions(values: string[]) {
       permissions.push(area + ".read");
   }
   if (
-    permissions.includes("approvals.merge") &&
+    permissions.some((p) =>
+      ["approvals.merge", "approvals.work", "deploy.run"].includes(p),
+    ) &&
     !permissions.includes("tasks.read")
   )
     permissions.push("tasks.read");
@@ -80,6 +84,8 @@ export function effectivePermissions(input: {
         "project.settings",
         "approvals.tasks",
         "approvals.merge",
+        "approvals.work",
+        "deploy.run",
       ].includes(p) ||
       ([
         "tasks.assign",

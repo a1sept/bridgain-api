@@ -40,3 +40,15 @@ test('role updates without color preserve persisted color by omitting update fie
 test('invalid role colors rejected before database write',()=>{
  for(const color of ['red','#FFF','#1234567','123456',null,123,'#GG0000']) assert.throws(()=>roleDefinition({name:'개발',permissions:[],color}));
 });
+
+test('new work approval and deployment permissions are never implicitly granted to legacy members',()=>{
+ for(const extra of [{},{isAdmin:true},{canApproveMerge:true},{canApproveTasks:true}]) {
+  const permissions=effectivePermissions({...base,...extra});
+  assert.equal(permissions.includes('approvals.work'),false);
+  assert.equal(permissions.includes('deploy.run'),false);
+ }
+ const assigned=effectivePermissions({...base,rolesConfigured:true,rolePermissions:['approvals.work','deploy.run']});
+ assert.ok(assigned.includes('tasks.read'));
+ assert.ok(assigned.includes('approvals.work'));
+ assert.ok(assigned.includes('deploy.run'));
+});

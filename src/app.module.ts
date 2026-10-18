@@ -1,4 +1,8 @@
 import { ProjectRolesController } from "./workspace/project-roles.controller.js";
+import { StagedWorkController } from "./workspace/staged-work.controller.js";
+import { StagedWorkService } from "./workspace/staged-work.service.js";
+import { StageSettingsController } from "./workspace/stage-settings.controller.js";
+import { StageSettingsService } from "./workspace/stage-settings.service.js";
 import { ProjectRolesService } from "./workspace/project-roles.service.js";
 import { ApprovalService } from "./workspace/approval.service.js";
 import { ApprovalController } from "./workspace/approval.controller.js";
@@ -21,6 +25,8 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    StagedWorkController,
+    StageSettingsController,
     ProjectRolesController,
     ApprovalController,
     GithubConnectionController,
@@ -33,6 +39,8 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    StagedWorkService,
+    StageSettingsService,
     ProjectRolesService,
     ApprovalService,
     GithubConnectionService,

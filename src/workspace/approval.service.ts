@@ -17,6 +17,8 @@ import {
   projectTasks,
   taskRequests,
   taskAssignees,
+  taskDependencies,
+  taskWorkReviewers,
   type ApprovalPlan,
 } from "../db/schema/project-work.js";
 import {
@@ -26,6 +28,7 @@ import {
 import { ids, choice } from "./project-work.service.js";
 import { uuid, bounded } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
+import { parseStagePlans } from "./stage-plan-policy.js";
 type User = { id: string; displayName: string; accountType: string };
 type Tx = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
 @Injectable()
@@ -34,7 +37,7 @@ export class ApprovalService {
     private readonly database: DatabaseService,
     private readonly requests: RequestsService,
   ) {}
-  async eligible(tx: Tx, pid: string) {
+  async eligible(tx: Tx, pid: string, work = false) {
     const rows = await tx
       .select({
         userId: users.id,
@@ -61,13 +64,29 @@ export class ApprovalService {
     for (const x of rows) {
       if (
         x.accessRole !== "client" &&
-        (
-          await this.requests.access(
-            tx,
-            { id: x.userId, displayName: x.displayName, accountType: "team" },
-            pid,
-          )
-        ).canApproveTasks
+        (work
+          ? (
+              await this.requests.access(
+                tx,
+                {
+                  id: x.userId,
+                  displayName: x.displayName,
+                  accountType: "team",
+                },
+                pid,
+              )
+            ).permissions.includes("approvals.work")
+          : (
+              await this.requests.access(
+                tx,
+                {
+                  id: x.userId,
+                  displayName: x.displayName,
+                  accountType: "team",
+                },
+                pid,
+              )
+            ).canApproveTasks)
       )
         eligible.push(x);
     }
@@ -132,7 +151,9 @@ export class ApprovalService {
         const p = await this.requests.access(tx, u, pid);
         if (
           !p.isDeveloper ||
-          (!p.permissions.includes("requests.read") && !p.canApproveTasks)
+          (!p.permissions.includes("requests.read") &&
+            !p.canApproveTasks &&
+            !p.permissions.includes("approvals.work"))
         )
           fail(403, "FORBIDDEN", "승인 내역을 조회할 권한이 없습니다.");
       }
@@ -160,17 +181,55 @@ export class ApprovalService {
           visible.push(row);
       }
       const out = await Promise.all(visible.map((a) => this.output(tx, a, u)));
+      const workApprovals = [];
+      for (const projectId of projectIds) {
+        const access = await this.requests.access(tx, u, projectId);
+        if (
+          !access.isDeveloper ||
+          !access.permissions.includes("approvals.work") ||
+          !access.permissions.includes("tasks.read")
+        )
+          continue;
+        const pending = await tx
+          .select({
+            id: projectTasks.id,
+            projectId: projectTasks.projectId,
+            projectName: projects.name,
+            title: projectTasks.title,
+            stageName: projectTasks.stageName,
+            status: projectTasks.status,
+            workRevision: projectTasks.workRevision,
+          })
+          .from(taskWorkReviewers)
+          .innerJoin(
+            projectTasks,
+            eq(projectTasks.id, taskWorkReviewers.taskId),
+          )
+          .innerJoin(projects, eq(projects.id, projectTasks.projectId))
+          .where(
+            and(
+              eq(projectTasks.projectId, projectId),
+              eq(taskWorkReviewers.userId, u.id),
+              eq(taskWorkReviewers.status, "pending"),
+              eq(projectTasks.status, "review_pending"),
+            ),
+          );
+        workApprovals.push(...pending.map((t) => ({ ...t, canApprove: true })));
+      }
       return {
         approvals: out,
+        workApprovals,
         canApproveTasks: (
           await Promise.all(projectIds.map((id) => this.eligible(tx, id)))
         )
           .flat()
           .some((x) => x.userId === u.id),
-        pendingCount: out.filter((a) => a.canApprove).length,
+        pendingCount:
+          out.filter((a) => a.canApprove).length + workApprovals.length,
         ...(pid
           ? {
               approvers: await this.eligible(tx, pid),
+              workApprovers: await this.eligible(tx, pid, true),
               canApproveTasks: (await this.eligible(tx, pid)).some(
                 (x) => x.userId === u.id,
               ),
@@ -227,20 +286,33 @@ export class ApprovalService {
       if (!Array.isArray(raw) || !raw.length || raw.length > 50)
         fail(400, "PLAN_REQUIRED", "요청별 기획과 담당자를 입력해주세요.");
       const plans: ApprovalPlan[] = (raw as Record<string, unknown>[]).map(
-        (x) => ({
-          requestId: uuid(x.requestId).toLowerCase(),
-          planning: bounded(x.planning, 10000),
-          uiNotes: bounded(x.uiNotes ?? "", 10000, false),
-          apiNotes: bounded(x.apiNotes ?? "", 10000, false),
-          dbNotes: bounded(x.dbNotes ?? "", 10000, false),
-          priority: choice(x.priority ?? "normal", [
-            "urgent",
-            "high",
-            "normal",
-            "low",
-          ]),
-          assigneeIds: ids(x.assigneeIds),
-        }),
+        (x) => {
+          const stages = parseStagePlans(x.stages ?? undefined);
+          return {
+            requestId: uuid(x.requestId).toLowerCase(),
+            planning: bounded(
+              stages
+                ? typeof x.planning === "string" && x.planning.trim()
+                  ? x.planning
+                  : "단계별 업무 계획"
+                : x.planning,
+              10000,
+            ),
+            uiNotes: bounded(x.uiNotes ?? "", 10000, false),
+            apiNotes: bounded(x.apiNotes ?? "", 10000, false),
+            dbNotes: bounded(x.dbNotes ?? "", 10000, false),
+            priority: choice(x.priority ?? "normal", [
+              "urgent",
+              "high",
+              "normal",
+              "low",
+            ]),
+            assigneeIds: stages
+              ? [...new Set(stages.flatMap((s) => s.assigneeIds))]
+              : ids(x.assigneeIds),
+            ...(stages ? { stages } : {}),
+          };
+        },
       );
       if (new Set(plans.map((x) => x.requestId)).size !== plans.length)
         fail(400, "DUPLICATE_REQUEST", "요청을 중복 연결할 수 없습니다.");
@@ -261,6 +333,27 @@ export class ApprovalService {
           ),
         );
       for (const plan of plans) {
+        for (const stage of plan.stages ?? []) {
+          for (const id of stage.reviewerIds) {
+            if (!members.some((m) => m.id === id && m.role !== "client"))
+              fail(
+                400,
+                "INVALID_WORK_REVIEWER",
+                "프로젝트 개발팀 승인자를 지정해주세요.",
+              );
+            const access = await this.requests.access(
+              tx,
+              { id, displayName: "", accountType: "team" },
+              pid,
+            );
+            if (!access.permissions.includes("approvals.work"))
+              fail(
+                400,
+                "INVALID_WORK_REVIEWER",
+                "작업 승인 권한이 있는 승인자를 지정해주세요.",
+              );
+          }
+        }
         for (const id of plan.assigneeIds) {
           const memberAccess = await this.requests.access(
             tx,
@@ -475,6 +568,27 @@ export class ApprovalService {
           );
 
         for (const plan of a.plans) {
+          for (const stage of plan.stages ?? []) {
+            for (const id of stage.reviewerIds) {
+              if (!active.some((m) => m.id === id && m.role !== "client"))
+                fail(
+                  409,
+                  "WORK_REVIEWER_CHANGED",
+                  "작업 승인자의 참여 상태가 변경되었습니다.",
+                );
+              const access = await this.requests.access(
+                tx,
+                { id, displayName: "", accountType: "team" },
+                pid,
+              );
+              if (!access.permissions.includes("approvals.work"))
+                fail(
+                  409,
+                  "WORK_REVIEWER_CHANGED",
+                  "작업 승인자의 권한이 변경되었습니다.",
+                );
+            }
+          }
           for (const id of plan.assigneeIds) {
             const memberAccess = await this.requests.access(
               tx,
@@ -499,46 +613,108 @@ export class ApprovalService {
             .where(eq(taskRequests.requestId, plan.requestId));
           if (existing.length)
             fail(409, "REQUEST_TASK_LINKED", "이미 업무화된 요청입니다.");
-          const [task] = await tx
-            .insert(projectTasks)
-            .values({
-              projectId: pid,
-              title: request.title,
-              description: [
-                plan.planning,
-                plan.uiNotes && `UI: ${plan.uiNotes}`,
-                plan.apiNotes && `API: ${plan.apiNotes}`,
-                plan.dbNotes && `DB: ${plan.dbNotes}`,
-              ]
-                .filter(Boolean)
-                .join("\n\n"),
-              priority: plan.priority,
-              createdBy: a.requestedBy,
-              approvalId: a.id,
-            })
-            .returning();
-          await tx
-            .insert(taskRequests)
-            .values({ taskId: task.id, requestId: plan.requestId });
-          await tx
-            .insert(taskAssignees)
-            .values(
-              plan.assigneeIds.map((userId) => ({ taskId: task.id, userId })),
-            );
-          await tx
-            .update(links)
-            .set({ taskId: task.id })
-            .where(eq(links.requestId, plan.requestId));
-          if (a.meetingId)
-            await tx
-              .update(meetingRequests)
-              .set({ taskId: task.id, ...plan })
-              .where(
-                and(
-                  eq(meetingRequests.meetingId, a.meetingId),
-                  eq(meetingRequests.requestId, plan.requestId),
-                ),
+          if (plan.stages?.length) {
+            const stageIds = new Map<string, string>();
+            for (const [order, stage] of plan.stages.entries()) {
+              const [task] = await tx
+                .insert(projectTasks)
+                .values({
+                  projectId: pid,
+                  title: stage.title,
+                  description: stage.brief,
+                  priority: plan.priority,
+                  createdBy: a.requestedBy,
+                  approvalId: a.id,
+                  stageKey: stage.id,
+                  stageName: stage.name,
+                  stageOrder: order,
+                  completionMode: stage.completionMode,
+                  status: stage.dependsOn.length ? "blocked" : "todo",
+                })
+                .returning();
+              stageIds.set(stage.id, task.id);
+              await tx
+                .insert(taskRequests)
+                .values({ taskId: task.id, requestId: plan.requestId });
+              await tx.insert(taskAssignees).values(
+                stage.assigneeIds.map((userId) => ({
+                  taskId: task.id,
+                  userId,
+                })),
               );
+              await tx.insert(taskWorkReviewers).values(
+                stage.reviewerIds.map((userId) => ({
+                  taskId: task.id,
+                  userId,
+                })),
+              );
+            }
+            for (const stage of plan.stages) {
+              if (stage.dependsOn.length)
+                await tx.insert(taskDependencies).values(
+                  stage.dependsOn.map((id) => ({
+                    taskId: stageIds.get(stage.id)!,
+                    predecessorId: stageIds.get(id)!,
+                  })),
+                );
+            }
+            const anchor = stageIds.get(plan.stages[0].id)!;
+            await tx
+              .update(links)
+              .set({ taskId: anchor })
+              .where(eq(links.requestId, plan.requestId));
+            if (a.meetingId)
+              await tx
+                .update(meetingRequests)
+                .set({ taskId: anchor, ...plan })
+                .where(
+                  and(
+                    eq(meetingRequests.meetingId, a.meetingId),
+                    eq(meetingRequests.requestId, plan.requestId),
+                  ),
+                );
+          } else {
+            const [task] = await tx
+              .insert(projectTasks)
+              .values({
+                projectId: pid,
+                title: request.title,
+                description: [
+                  plan.planning,
+                  plan.uiNotes && `UI: ${plan.uiNotes}`,
+                  plan.apiNotes && `API: ${plan.apiNotes}`,
+                  plan.dbNotes && `DB: ${plan.dbNotes}`,
+                ]
+                  .filter(Boolean)
+                  .join("\n\n"),
+                priority: plan.priority,
+                createdBy: a.requestedBy,
+                approvalId: a.id,
+              })
+              .returning();
+            await tx
+              .insert(taskRequests)
+              .values({ taskId: task.id, requestId: plan.requestId });
+            await tx
+              .insert(taskAssignees)
+              .values(
+                plan.assigneeIds.map((userId) => ({ taskId: task.id, userId })),
+              );
+            await tx
+              .update(links)
+              .set({ taskId: task.id })
+              .where(eq(links.requestId, plan.requestId));
+            if (a.meetingId)
+              await tx
+                .update(meetingRequests)
+                .set({ taskId: task.id, ...plan })
+                .where(
+                  and(
+                    eq(meetingRequests.meetingId, a.meetingId),
+                    eq(meetingRequests.requestId, plan.requestId),
+                  ),
+                );
+          }
           await tx.insert(requestEvents).values({
             requestId: plan.requestId,
             kind: "workflow_stage",

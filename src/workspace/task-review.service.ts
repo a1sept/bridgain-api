@@ -63,6 +63,7 @@ export class TaskReviewService {
       );
     let updated = 0;
     for (const linkedTask of linked) {
+      if (linkedTask.stageKey) continue;
       updated += await this.database.db.transaction(async (tx) => {
         await tx
           .select({ id: teams.id })
@@ -172,6 +173,12 @@ export class TaskReviewService {
         .where(and(eq(tasks.id, uuid(id)), eq(tasks.projectId, pid)))
         .for("update");
       if (!task) return fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
+      if (task.stageKey)
+        fail(
+          409,
+          "STAGED_WORK_REQUIRED",
+          "단계별 업무는 작업 승인과 배포 목록에서 처리해주세요.",
+        );
       if (!task.mergeApprovalRequired && action !== "merge")
         fail(
           409,

@@ -1,4 +1,5 @@
 import { resolveProjectPermissions } from "./project-roles.service.js";
+import { customerWorkflowStage } from "./workflow-progress.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, inArray, desc, asc, sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -114,7 +115,11 @@ export class RequestsService {
       .innerJoin(users, eq(users.id, taskAssignees.userId))
       .where(eq(taskRequests.requestId, request.id));
     const linkedTasks = await tx
-      .select({ status: projectTasks.status })
+      .select({
+        status: projectTasks.status,
+        completionMode: projectTasks.completionMode,
+        stageKey: projectTasks.stageKey,
+      })
       .from(taskRequests)
       .innerJoin(projectTasks, eq(projectTasks.id, taskRequests.taskId))
       .where(eq(taskRequests.requestId, request.id));
@@ -122,13 +127,10 @@ export class RequestsService {
       .select()
       .from(requestWorkflowLinks)
       .where(eq(requestWorkflowLinks.requestId, request.id));
-    const workflowStage = linkedTasks.length
-      ? linkedTasks.every((x) => x.status === "released")
-        ? "completed"
-        : "in_progress"
-      : link?.meetingId || link?.approvalId
-        ? "review"
-        : "received";
+    const workflowStage = customerWorkflowStage(
+      linkedTasks,
+      !!(link?.meetingId || link?.approvalId),
+    );
     return {
       ...request,
       workflowStage,
@@ -260,6 +262,8 @@ export class RequestsService {
           id: projectTasks.id,
           title: projectTasks.title,
           status: projectTasks.status,
+          completionMode: projectTasks.completionMode,
+          stageKey: projectTasks.stageKey,
           resultSummary: projectTasks.resultSummary,
         })
         .from(taskRequests)
@@ -279,7 +283,20 @@ export class RequestsService {
         )
         .where(eq(meetingRequests.requestId, rid));
       return {
-        workflow: { tasks: workflowTasks, meetings: workflowMeetings },
+        workflow: {
+          tasks: workflowTasks.map(({ completionMode, stageKey, ...task }) => ({
+            ...task,
+            status:
+              u.accountType === "client"
+                ? customerWorkflowStage([
+                    { ...task, completionMode, stageKey },
+                  ]) === "completed"
+                  ? "released"
+                  : "in_progress"
+                : task.status,
+          })),
+          meetings: workflowMeetings,
+        },
         request: await this.output(tx, request),
         events: events.map((event) => ({
           ...event,

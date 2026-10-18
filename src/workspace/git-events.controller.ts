@@ -1,3 +1,4 @@
+import { StagedWorkService } from "./staged-work.service.js";
 import { TaskReviewService } from "./task-review.service.js";
 import { Controller, Post, Req, Headers, RawBodyRequest } from "@nestjs/common";
 import type { Request } from "express";
@@ -107,6 +108,7 @@ export class GitEventsController {
   constructor(
     private readonly work: ProjectWorkService,
     private readonly reviews: TaskReviewService,
+    private readonly staged: StagedWorkService,
   ) {}
   @Post() async receive(
     @Req() req: RawBodyRequest<Request>,
@@ -114,15 +116,19 @@ export class GitEventsController {
     @Headers("x-github-event") event: string,
   ) {
     verifyGitEvent(req.rawBody, signature, process.env.GITHUB_WEBHOOK_SECRET);
-    if (event === "pull_request" && req.body?.pull_request?.merged !== true)
-      return this.reviews.syncPullRequest(req.body);
+    if (event === "pull_request" && req.body?.pull_request?.merged !== true) {
+      const staged = await this.staged.syncPullRequest(req.body);
+      const legacy = await this.reviews.syncPullRequest(req.body);
+      return { updated: staged.updated + legacy.updated };
+    }
     const parsed = parseGitEvent(
       event,
       req.body,
       process.env.GITHUB_DEPLOYMENT_ENVIRONMENT || "production",
     );
-    return parsed
-      ? this.work.applyGitEvent(parsed)
-      : { updated: 0, ignored: true };
+    if (!parsed) return { updated: 0, ignored: true };
+    const staged = await this.staged.applyGitEvent(parsed);
+    const legacy = await this.work.applyGitEvent(parsed);
+    return { updated: staged.updated + legacy.updated };
   }
 }

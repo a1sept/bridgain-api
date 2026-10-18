@@ -22,6 +22,9 @@ import {
   documentVersions,
   projectTasks as tasks,
   taskAssignees,
+  taskDependencies,
+  taskWorkReviewers,
+  taskWorkEvents,
   taskRequests,
   projectMeetings as meetings,
   projectDocuments as documents,
@@ -33,6 +36,8 @@ import {
 } from "./requests.service.js";
 import { bounded, uuid } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
+import { parseStagePlans } from "./stage-plan-policy.js";
+import { customerWorkflowStage } from "./workflow-progress.js";
 import type { GitEvent } from "./git-events.controller.js";
 type User = { id: string; displayName: string; accountType: string };
 type Tx = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
@@ -223,7 +228,11 @@ export class ProjectWorkService {
     permissions?: string[],
   ) {
     const assignees = await tx
-      .select({ userId: users.id, displayName: users.displayName })
+      .select({
+        userId: users.id,
+        displayName: users.displayName,
+        completedAt: taskAssignees.completedAt,
+      })
       .from(taskAssignees)
       .innerJoin(users, eq(users.id, taskAssignees.userId))
       .where(eq(taskAssignees.taskId, row.id));
@@ -261,6 +270,85 @@ export class ProjectWorkService {
               .where(eq(documentVersions.taskId, row.id))
               .orderBy(desc(documentVersions.createdAt)),
       assignees,
+      completedAssigneeIds: assignees
+        .filter((x) => x.completedAt)
+        .map((x) => x.userId),
+      workReviewers: await tx
+        .select({
+          userId: users.id,
+          displayName: users.displayName,
+          status: taskWorkReviewers.status,
+          note: taskWorkReviewers.note,
+          actedAt: taskWorkReviewers.actedAt,
+        })
+        .from(taskWorkReviewers)
+        .innerJoin(users, eq(users.id, taskWorkReviewers.userId))
+        .where(eq(taskWorkReviewers.taskId, row.id)),
+      dependencies: await Promise.all(
+        (
+          await tx
+            .select({
+              predecessorId: tasks.id,
+              title: tasks.title,
+              status: tasks.status,
+              completionMode: tasks.completionMode,
+              resultSummary: tasks.resultSummary,
+              verification: tasks.verification,
+              workRevision: tasks.workRevision,
+            })
+            .from(taskDependencies)
+            .innerJoin(tasks, eq(tasks.id, taskDependencies.predecessorId))
+            .where(eq(taskDependencies.taskId, row.id))
+        ).map(async (dep) => {
+          const [approved] = await tx
+            .select({ createdAt: taskWorkEvents.createdAt })
+            .from(taskWorkEvents)
+            .where(
+              and(
+                eq(taskWorkEvents.taskId, dep.predecessorId),
+                eq(taskWorkEvents.action, "approved"),
+                eq(taskWorkEvents.revision, dep.workRevision),
+              ),
+            )
+            .orderBy(desc(taskWorkEvents.createdAt))
+            .limit(1);
+          const finalized =
+            !!approved &&
+            ["done", "deploy_pending", "deploying", "released"].includes(
+              dep.status,
+            );
+          return {
+            ...dep,
+            resultSummary: finalized ? dep.resultSummary : "",
+            verification: finalized ? dep.verification : "",
+            documentVersions:
+              !finalized ||
+              (permissions && !permissions.includes("documents.read"))
+                ? []
+                : await tx
+                    .select({
+                      id: documentVersions.id,
+                      documentId: documentVersions.documentId,
+                      title: documentVersions.title,
+                      url: documentVersions.url,
+                    })
+                    .from(documentVersions)
+                    .where(
+                      and(
+                        eq(documentVersions.taskId, dep.predecessorId),
+                        sql`${documentVersions.createdAt} <= ${approved.createdAt}`,
+                      ),
+                    )
+                    .orderBy(desc(documentVersions.createdAt)),
+          };
+        }),
+      ),
+      workEvents: await tx
+        .select({ event: taskWorkEvents, actorName: users.displayName })
+        .from(taskWorkEvents)
+        .innerJoin(users, eq(users.id, taskWorkEvents.actorId))
+        .where(eq(taskWorkEvents.taskId, row.id))
+        .orderBy(desc(taskWorkEvents.createdAt)),
       requests,
       assigneeIds: assignees.map((x) => x.userId),
       requestIds: requests.map((x) => x.id),
@@ -355,6 +443,97 @@ export class ProjectWorkService {
           "배포 완료 후 변경은 새 요청으로 등록해주세요.",
         );
       const current = old ? await this.taskOutput(tx, old) : undefined;
+      if (old?.stageKey) {
+        if (gitEvent)
+          fail(
+            409,
+            "STAGED_ACTION_REQUIRED",
+            "단계 업무는 작업 승인·배포 절차를 사용해주세요.",
+          );
+        if (!current?.assigneeIds.includes(u.id))
+          fail(
+            403,
+            "TASK_ASSIGNEE_REQUIRED",
+            "배정된 담당자만 업무를 진행할 수 있습니다.",
+          );
+        if (
+          !["todo", "in_progress"].includes(old.status) ||
+          current?.assignees.some((x) => x.completedAt)
+        )
+          fail(
+            409,
+            "WORK_LOCKED",
+            "완료 제출한 작업은 재작업 요청 후 수정할 수 있습니다.",
+          );
+        const mutable = new Set([
+          "expectedVersion",
+          "status",
+          "repositoryUrl",
+          "workBranch",
+          "liveBranch",
+          "pullRequestUrl",
+          "resultSummary",
+          "dbChanges",
+          "apiChanges",
+          "frontendChanges",
+          "verification",
+        ]);
+        if (old.completionMode === "deploy") mutable.add("deploymentUrl");
+        for (const key of Object.keys(b))
+          if (!mutable.has(key))
+            fail(
+              403,
+              "APPROVED_SCOPE_LOCKED",
+              "승인된 업무 범위와 배포 정보는 수정할 수 없습니다.",
+            );
+        const status =
+          b.status === undefined
+            ? old.status
+            : choice(b.status, ["todo", "in_progress"]);
+        if (old.status === "in_progress" && status !== "in_progress")
+          fail(
+            409,
+            "INVALID_TRANSITION",
+            "작업 완료 또는 재작업 절차를 사용해주세요.",
+          );
+        const values: Partial<typeof tasks.$inferInsert> = {
+          status,
+          version: randomUUID(),
+          updatedAt: new Date(),
+        };
+        for (const key of [
+          "resultSummary",
+          "dbChanges",
+          "apiChanges",
+          "frontendChanges",
+          "verification",
+        ] as const)
+          if (b[key] !== undefined) values[key] = bounded(b[key], 10000, false);
+        for (const key of ["repositoryUrl", "pullRequestUrl"] as const)
+          if (b[key] !== undefined) values[key] = documentUrl(b[key]);
+        if (old.completionMode === "deploy" && b.deploymentUrl !== undefined)
+          values.deploymentUrl = documentUrl(b.deploymentUrl);
+        if (b.workBranch !== undefined)
+          values.workBranch = bounded(b.workBranch, 200, false);
+        if (b.liveBranch !== undefined && b.liveBranch !== "main")
+          fail(400, "MAIN_REQUIRED", "배포 대상 브랜치는 main입니다.");
+        const branch = values.workBranch ?? old.workBranch;
+        if (
+          branch &&
+          (!/^(?!.*(?:\.\.|@\{|[~^:?*\\\s]))(?![/.])(?!.*[/.]$).+$/.test(
+            branch,
+          ) ||
+            branch === "main")
+        )
+          fail(400, "INVALID_BRANCH", "유효한 작업 브랜치를 입력해주세요.");
+        const [row] = await tx
+          .update(tasks)
+          .set(values)
+          .where(eq(tasks.id, old.id))
+          .returning();
+        await this.event(tx, u, pid, old.id, "task_updated", old.title);
+        return { task: await this.taskOutput(tx, row, taskAccess.permissions) };
+      }
       if (old && !gitEvent) {
         if (!current?.assigneeIds.includes(u.id))
           fail(
@@ -924,6 +1103,7 @@ export class ProjectWorkService {
             "low",
           ]),
           assigneeIds: ids(item.assigneeIds ?? []),
+          stages: parseStagePlans(item.stages ?? undefined, true),
         };
       });
       if (new Set(plans.map((x) => x.requestId)).size !== plans.length)
@@ -1276,6 +1456,7 @@ export class ProjectWorkService {
     let updated = 0;
     const failed: { taskId: string; code: string }[] = [];
     for (const task of rows) {
+      if (task.stageKey) continue;
       if (task.liveBranch !== event.branch) continue;
       if (
         event.kind === "merge" &&
@@ -1359,11 +1540,21 @@ export class ProjectWorkService {
   ) {
     for (const rid of requestIds) {
       const linked = await tx
-        .select({ status: tasks.status })
+        .select({
+          status: tasks.status,
+          stageKey: tasks.stageKey,
+          completionMode: tasks.completionMode,
+        })
         .from(taskRequests)
         .innerJoin(tasks, eq(tasks.id, taskRequests.taskId))
         .where(eq(taskRequests.requestId, rid));
-      const status = requestProgress(linked.map((t) => t.status));
+      const stage = customerWorkflowStage(linked);
+      const status =
+        stage === "completed"
+          ? "completed"
+          : stage === "in_progress"
+            ? "in_progress"
+            : "received";
       const [request] = await tx
         .select()
         .from(projectRequests)

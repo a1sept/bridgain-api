@@ -37,6 +37,12 @@ export const projectTasks = pgTable(
   {
     ...common(),
     approvalId: uuid("approval_id"),
+    stageKey: text("stage_key").notNull().default(""),
+    stageName: text("stage_name").notNull().default(""),
+    stageOrder: integer("stage_order").notNull().default(0),
+    completionMode: text("completion_mode").notNull().default("code"),
+    workRevision: integer("work_revision").notNull().default(1),
+    approvedHeadSha: text("approved_head_sha").notNull().default(""),
     version: uuid("version").notNull().defaultRandom(),
     description: text("description").notNull().default(""),
     status: text("status").notNull().default("todo"),
@@ -76,7 +82,11 @@ export const projectTasks = pgTable(
     index("task_project_idx").on(t.projectId, t.createdAt),
     check(
       "task_status_check",
-      sql`${t.status} IN ('todo','in_progress','done','released')`,
+      sql`${t.status} IN ('blocked','todo','in_progress','review_pending','done','deploy_pending','deploying','released')`,
+    ),
+    check(
+      "task_completion_mode_check",
+      sql`${t.completionMode} IN ('document','design','code','test','deploy')`,
     ),
     check(
       "task_priority_check",
@@ -93,6 +103,7 @@ export const taskAssignees = pgTable(
     userId: uuid("user_id")
       .notNull()
       .references(() => users.id),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (t) => [primaryKey({ columns: [t.taskId, t.userId] })],
 );
@@ -190,6 +201,7 @@ export const meetingRequests = pgTable(
     dbNotes: text("db_notes").notNull().default(""),
     priority: text("priority").notNull().default("normal"),
     assigneeIds: jsonb("assignee_ids").$type<string[]>().notNull().default([]),
+    stages: jsonb("stages").$type<StagePlan[]>(),
     taskId: uuid("task_id").references(() => projectTasks.id),
   },
   (t) => [
@@ -298,6 +310,16 @@ export const taskApprovals = pgTable(
     ),
   ],
 );
+export type StagePlan = {
+  id: string;
+  name: string;
+  title: string;
+  brief: string;
+  completionMode: "document" | "design" | "code" | "test" | "deploy";
+  assigneeIds: string[];
+  reviewerIds: string[];
+  dependsOn: string[];
+};
 export type ApprovalPlan = {
   requestId: string;
   planning: string;
@@ -306,6 +328,7 @@ export type ApprovalPlan = {
   dbNotes: string;
   priority: string;
   assigneeIds: string[];
+  stages?: StagePlan[];
 };
 export const taskApprovalReviewers = pgTable(
   "task_approval_reviewers",
@@ -329,4 +352,110 @@ export const requestWorkflowLinks = pgTable("request_workflow_links", {
   meetingId: uuid("meeting_id").references(() => projectMeetings.id),
   approvalId: uuid("approval_id").references(() => taskApprovals.id),
   taskId: uuid("task_id").references(() => projectTasks.id),
+});
+
+export const taskDependencies = pgTable(
+  "task_dependencies",
+  {
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => projectTasks.id),
+    predecessorId: uuid("predecessor_id")
+      .notNull()
+      .references(() => projectTasks.id),
+  },
+  (t) => [
+    primaryKey({ columns: [t.taskId, t.predecessorId] }),
+    check("task_dependency_self_check", sql`${t.taskId} <> ${t.predecessorId}`),
+  ],
+);
+export const taskWorkReviewers = pgTable(
+  "task_work_reviewers",
+  {
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => projectTasks.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    status: text("status").notNull().default("pending"),
+    note: text("note").notNull().default(""),
+    actedAt: timestamp("acted_at", { withTimezone: true }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.taskId, t.userId] }),
+    check(
+      "task_work_reviewer_status_check",
+      sql`${t.status} IN ('pending','approved')`,
+    ),
+  ],
+);
+export const taskWorkEvents = pgTable(
+  "task_work_events",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => projectTasks.id),
+    actorId: uuid("actor_id")
+      .notNull()
+      .references(() => users.id),
+    action: text("action").notNull(),
+    revision: integer("revision").notNull().default(1),
+    headSha: text("head_sha").notNull().default(""),
+    note: text("note").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("task_work_events_idx").on(t.taskId, t.createdAt)],
+);
+export const taskDeploymentAttempts = pgTable(
+  "task_deployment_attempts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => projectTasks.id),
+    actorId: uuid("actor_id")
+      .notNull()
+      .references(() => users.id),
+    status: text("status").notNull().default("pending"),
+    headSha: text("head_sha").notNull().default(""),
+    note: text("note").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("task_deployment_attempts_idx").on(t.taskId, t.createdAt)],
+);
+
+export type ProjectStageType = {
+  id: string;
+  name: string;
+  completionMode: StagePlan["completionMode"];
+  roleIds?: string[];
+};
+export type ProjectStagePreset = {
+  id: string;
+  name: string;
+  stages: {
+    id: string;
+    name: string;
+    completionMode: StagePlan["completionMode"];
+    dependsOn: string[];
+  }[];
+};
+export const projectStageSettings = pgTable("project_stage_settings", {
+  projectId: uuid("project_id")
+    .primaryKey()
+    .references(() => projects.id),
+  stageTypes: jsonb("stage_types")
+    .$type<ProjectStageType[]>()
+    .notNull()
+    .default([]),
+  presets: jsonb("presets").$type<ProjectStagePreset[]>().notNull().default([]),
 });
