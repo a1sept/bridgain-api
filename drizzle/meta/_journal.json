@@ -99,6 +99,13 @@
       "when": 1792294822120,
       "tag": "0013_cultured_blonde_phantom",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1792302590404,
+      "tag": "0014_easy_squadron_supreme",
+      "breakpoints": true
     }
   ]
 }

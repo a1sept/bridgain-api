@@ -113,7 +113,7 @@ export class TaskReviewService {
   async history(u: User, pid: string, id: string) {
     return this.database.db.transaction(async (tx) => {
       const access = await this.requests.access(tx, u, pid);
-      if (!access.canManage)
+      if (!access.isDeveloper)
         fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
       const [task] = await tx
         .select()
@@ -153,7 +153,7 @@ export class TaskReviewService {
     return this.database.db.transaction(async (tx) => {
       // Same team lock as membership edits/task updates: revocation and merge cannot race.
       const access = await this.requests.access(tx, u, pid, true);
-      if (!access.canManage)
+      if (!access.isDeveloper)
         fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
       const [task] = await tx
         .select()

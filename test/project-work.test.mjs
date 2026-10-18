@@ -58,7 +58,7 @@ test("every internal read and write denies client project members before data ac
   );
   const service = new ProjectWorkService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: false }) },
+    { access: async () => ({ isDeveloper: false }) },
   );
   const user = { id: "client", displayName: "Client", accountType: "client" };
   for (const [method, args] of [

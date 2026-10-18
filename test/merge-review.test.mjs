@@ -66,7 +66,7 @@ function fixture(overrides = {}) {
     calls = [];
   const state = {
     allowed: true,
-    canManage: true,
+    isDeveloper: true,
     canAssign: false,
     saves: 0,
     protectedTasks: [],
@@ -154,7 +154,7 @@ function fixture(overrides = {}) {
   };
   const requests = {
     access: async () => ({
-      canManage: state.canManage,
+      isDeveloper: state.isDeveloper,
       canAssign: state.canAssign,
     }),
   };
@@ -291,7 +291,7 @@ test("revoked reviewer, client access, and self review cannot trigger GitHub mut
   await usingGithub(f, async () => {
     f.state.allowed = false;
     await rejects(act(f, dev, "merge"), 403);
-    f.state.canManage = false;
+    f.state.isDeveloper = false;
     await rejects(act(f, dev, "request"), 403);
     assert.equal(f.calls.length, 0);
   });
@@ -533,7 +533,7 @@ test("stale task forms cannot overwrite a newer human or AI result", async () =>
   await f.work.saveTask(
     dev,
     pid,
-    { expectedVersion: f.task().version, description: "Reviewed latest" },
+    { expectedVersion: f.task().version, resultSummary: "New AI result" },
     id,
   );
   assert.equal(f.task().resultSummary, "New AI result");
@@ -603,7 +603,7 @@ test("result records reject projects without access and unfinished tasks", async
     }),
     409,
   );
-  f.state.canManage = false;
+  f.state.isDeveloper = false;
   await rejects(
     f.work.appendResult(dev, pid, id, {
       expectedVersion: f.task().version,

@@ -14,6 +14,8 @@ import {
 } from "../db/schema/workspace.js";
 import { projectRequests, requestEvents } from "../db/schema/requests.js";
 import {
+  requestWorkflowLinks,
+  taskApprovals,
   taskResultEntries,
   taskReviewEvents,
   meetingRequests,
@@ -134,7 +136,7 @@ export class ProjectWorkService {
   }
   private async access(tx: Tx, u: User, pid: string, lock = false) {
     const access = await this.requests.access(tx, u, pid, lock);
-    if (!access.canManage)
+    if (!access.isDeveloper)
       fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
   }
   private async event(
@@ -268,6 +270,12 @@ export class ProjectWorkService {
       await this.access(tx, u, pid, true);
       if (!b || typeof b !== "object" || Array.isArray(b))
         fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
+      if (!id)
+        fail(
+          403,
+          "APPROVAL_REQUIRED",
+          "업무는 승인 요청이 승인된 뒤 생성됩니다.",
+        );
       let old: typeof tasks.$inferSelect | undefined;
       if (id) {
         [old] = await tx
@@ -301,7 +309,47 @@ export class ProjectWorkService {
               )))
       )
         return { task: await this.taskOutput(tx, old), ignored: true };
+      if (
+        old?.status === "released" &&
+        b.status !== undefined &&
+        b.status !== "released"
+      )
+        fail(
+          409,
+          "TASK_RELEASED",
+          "배포 완료 후 변경은 새 요청으로 등록해주세요.",
+        );
       const current = old ? await this.taskOutput(tx, old) : undefined;
+      if (old && !gitEvent) {
+        if (!current?.assigneeIds.includes(u.id))
+          fail(
+            403,
+            "TASK_ASSIGNEE_REQUIRED",
+            "배정된 담당자만 업무를 진행할 수 있습니다.",
+          );
+        for (const key of [
+          "title",
+          "description",
+          "priority",
+          "dueDate",
+          "assigneeIds",
+          "requestIds",
+        ] as const) {
+          const previous =
+            key === "assigneeIds" || key === "requestIds"
+              ? current?.[key]
+              : old[key];
+          if (
+            b[key] !== undefined &&
+            JSON.stringify(b[key]) !== JSON.stringify(previous)
+          )
+            fail(
+              403,
+              "APPROVED_SCOPE_LOCKED",
+              "승인된 업무의 범위와 담당자, 요청 연결은 변경할 수 없습니다.",
+            );
+        }
+      }
       const title = bounded(b?.title ?? old?.title, 160),
         description = bounded(
           b?.description ?? old?.description ?? "",
@@ -661,6 +709,18 @@ export class ProjectWorkService {
         .where(and(eq(tasks.id, uuid(id)), eq(tasks.projectId, pid)))
         .for("update");
       if (!task) return fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
+      const assigned = await tx
+        .select()
+        .from(taskAssignees)
+        .where(
+          and(eq(taskAssignees.taskId, id), eq(taskAssignees.userId, u.id)),
+        );
+      if (!assigned.length)
+        fail(
+          403,
+          "TASK_ASSIGNEE_REQUIRED",
+          "배정된 담당자만 업무 결과를 기록할 수 있습니다.",
+        );
       if (b.expectedVersion !== task.version)
         fail(
           409,
@@ -769,6 +829,29 @@ export class ProjectWorkService {
         b.decisionStatus ?? old?.decisionStatus ?? "draft",
         ["draft", "final"],
       );
+      if (decisionStatus === "final")
+        fail(
+          403,
+          "APPROVAL_REQUIRED",
+          "최종안은 승인 요청 후 필수 승인자 전원이 승인해야 합니다.",
+        );
+      if (old) {
+        const pending = await tx
+          .select()
+          .from(taskApprovals)
+          .where(
+            and(
+              eq(taskApprovals.meetingId, old.id),
+              eq(taskApprovals.status, "pending"),
+            ),
+          );
+        if (pending.length)
+          fail(
+            409,
+            "APPROVAL_PENDING",
+            "승인 요청을 취소한 후 회의를 변경해주세요.",
+          );
+      }
       const previous = old
         ? await tx
             .select()
@@ -804,28 +887,106 @@ export class ProjectWorkService {
       });
       if (new Set(plans.map((x) => x.requestId)).size !== plans.length)
         fail(400, "VALIDATION_ERROR", "같은 요청을 중복 연결할 수 없습니다.");
-      if (decisionStatus === "final" && !plans.length)
-        fail(400, "VALIDATION_ERROR", "최종안에는 고객 요청을 연결해주세요.");
       for (const plan of plans) {
         await this.links(tx, pid, plan.assigneeIds, [plan.requestId]);
-        if (
-          decisionStatus === "draft" &&
-          (plan.assigneeIds.length || plan.priority !== "normal")
-        )
+      }
+      // The project/team lock serializes all workflow writes, including transfers.
+      for (const plan of plans) {
+        await tx
+          .select()
+          .from(projectRequests)
+          .where(eq(projectRequests.id, plan.requestId))
+          .for("update");
+        const tasksLinked = await tx
+          .select()
+          .from(taskRequests)
+          .where(eq(taskRequests.requestId, plan.requestId));
+        if (tasksLinked.length)
           fail(
-            400,
-            "MEETING_DRAFT",
-            "최종안에서만 개발 담당자를 할당할 수 있습니다.",
+            409,
+            "REQUEST_TASK_LINKED",
+            "이미 업무화된 요청은 회의에 다시 연결할 수 없습니다.",
           );
-        if (
-          decisionStatus === "final" &&
-          (!plan.assigneeIds.length || !plan.planning.trim())
-        )
-          fail(
-            400,
-            "ASSIGNMENT_REQUIRED",
-            "요청별 기획과 개발 담당자를 입력해주세요.",
-          );
+        const [link] = await tx
+          .select()
+          .from(requestWorkflowLinks)
+          .where(eq(requestWorkflowLinks.requestId, plan.requestId));
+        if (link?.approvalId) {
+          const [approval] = await tx
+            .select()
+            .from(taskApprovals)
+            .where(eq(taskApprovals.id, link.approvalId));
+          if (approval?.status === "pending" || approval?.status === "approved")
+            fail(
+              409,
+              "APPROVAL_PENDING",
+              "기존 승인 요청을 먼저 취소해주세요.",
+            );
+        }
+        if (link?.meetingId && link.meetingId !== old?.id) {
+          const [sourceMeeting] = await tx
+            .select()
+            .from(meetings)
+            .where(eq(meetings.id, link.meetingId));
+          if (sourceMeeting.decisionStatus === "final")
+            fail(
+              409,
+              "MEETING_FINAL",
+              "승인된 회의에서 요청을 이동할 수 없습니다.",
+            );
+          const confirmed = b.transferFromMeetingIds as
+            Record<string, unknown> | undefined;
+          if (confirmed?.[plan.requestId] !== link.meetingId)
+            fail(
+              409,
+              "REQUEST_MEETING_LINKED",
+              `이 요청은 '${sourceMeeting.title}' 회의에 연결되어 있습니다. 기존 회의에서 제외하고 이동하려면 확인해주세요. (${link.meetingId})`,
+            );
+          await tx
+            .insert(requestEvents)
+            .values({
+              requestId: plan.requestId,
+              kind: "meeting_transfer",
+              body: "연결 회의가 변경되었습니다.",
+              actorId: u.id,
+            });
+          // Keep old notes in history, but remove the current association.
+          await tx.insert(activity).values({
+            projectId: pid,
+            entityId: link.meetingId,
+            kind: "request_transferred",
+            body: JSON.stringify({
+              requestId: plan.requestId,
+              previous: await tx
+                .select()
+                .from(meetingRequests)
+                .where(
+                  and(
+                    eq(meetingRequests.meetingId, link.meetingId),
+                    eq(meetingRequests.requestId, plan.requestId),
+                  ),
+                ),
+            }),
+            actorId: u.id,
+          });
+          await tx
+            .delete(meetingRequests)
+            .where(
+              and(
+                eq(meetingRequests.meetingId, link.meetingId),
+                eq(meetingRequests.requestId, plan.requestId),
+              ),
+            );
+          await tx
+            .update(meetings)
+            .set({ requestId: null })
+            .where(
+              and(
+                eq(meetings.id, link.meetingId),
+                eq(meetings.requestId, plan.requestId),
+              ),
+            );
+        }
       }
       const duration = b?.durationMinutes ?? old?.durationMinutes ?? 60;
       if (
@@ -835,13 +996,7 @@ export class ProjectWorkService {
         duration > 480
       )
         fail(400, "VALIDATION_ERROR", "회의 시간은 15~480분입니다.");
-      const requestId =
-        b?.requestId === undefined
-          ? (old?.requestId ?? null)
-          : b.requestId === null
-            ? null
-            : uuid(b.requestId);
-      await this.links(tx, pid, [], requestId ? [requestId] : []);
+      const requestId = plans[0]?.requestId ?? null;
       const values = {
         title: bounded(b?.title ?? old?.title, 160),
         scheduledAt: meetingDate(
@@ -879,52 +1034,52 @@ export class ProjectWorkService {
         await tx
           .delete(meetingRequests)
           .where(eq(meetingRequests.meetingId, row.id));
+      for (const removed of previous.filter(
+        (x) => !plans.some((p) => p.requestId === x.requestId),
+      ))
+        await tx
+          .insert(requestEvents)
+          .values({
+            requestId: removed.requestId,
+            kind: "workflow_stage",
+            status: "received",
+            body: "회의 연결이 해제되어 요청 접수 단계로 돌아갔습니다.",
+            actorId: u.id,
+          });
+      if (old)
+        await tx
+          .update(requestWorkflowLinks)
+          .set({ meetingId: null })
+          .where(
+            and(
+              eq(requestWorkflowLinks.meetingId, old.id),
+              sql`${requestWorkflowLinks.taskId} IS NULL`,
+            ),
+          );
+      for (const plan of plans) {
+        await tx
+          .insert(requestWorkflowLinks)
+          .values({ requestId: plan.requestId, meetingId: row.id })
+          .onConflictDoUpdate({
+            target: requestWorkflowLinks.requestId,
+            set: { meetingId: row.id, approvalId: null },
+          });
+        await tx
+          .insert(requestEvents)
+          .values({
+            requestId: plan.requestId,
+            kind: "workflow_stage",
+            status: "review",
+            body: "회의 검토 단계입니다.",
+            actorId: u.id,
+          });
+      }
       for (const plan of plans) {
         let taskId: string | null = null;
-        if (decisionStatus === "final") {
-          const [request] = await tx
-            .select()
-            .from(projectRequests)
-            .where(eq(projectRequests.id, plan.requestId));
-          const [task] = await tx
-            .insert(tasks)
-            .values({
-              projectId: pid,
-              title: request.title,
-              description: [
-                plan.planning,
-                plan.uiNotes && `UI: ${plan.uiNotes}`,
-                plan.apiNotes && `API: ${plan.apiNotes}`,
-                plan.dbNotes && `DB: ${plan.dbNotes}`,
-              ]
-                .filter(Boolean)
-                .join("\n\n"),
-              priority: plan.priority,
-              createdBy: u.id,
-            })
-            .returning();
-          taskId = task.id;
-          await tx
-            .insert(taskRequests)
-            .values({ taskId, requestId: plan.requestId });
-          await tx
-            .insert(taskAssignees)
-            .values(
-              plan.assigneeIds.map((userId) => ({ taskId: task.id, userId })),
-            );
-          await this.event(tx, u, pid, task.id, "task_created", task.title);
-        }
         await tx
           .insert(meetingRequests)
           .values({ ...plan, meetingId: row.id, taskId });
       }
-      if (decisionStatus === "final")
-        await this.syncRequests(
-          tx,
-          u,
-          pid,
-          plans.map((plan) => plan.requestId),
-        );
       return {
         meeting: {
           ...row,

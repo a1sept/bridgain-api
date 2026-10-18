@@ -24,6 +24,7 @@ export const projectRequests = pgTable(
     projectId: uuid("project_id")
       .notNull()
       .references(() => projects.id),
+    origin: text("origin").notNull().default("customer"),
     title: text("title").notNull(),
     description: text("description").notNull(),
     type: text("type").notNull(),
@@ -38,6 +39,10 @@ export const projectRequests = pgTable(
       .defaultNow(),
   },
   (t) => [
+    check(
+      "request_origin_check",
+      sql`${t.origin} IN ('customer','development')`,
+    ),
     index("request_project_idx").on(t.projectId, t.createdAt),
     check("request_type_check", sql`${t.type} IN ('feature','bug','other')`),
     check(

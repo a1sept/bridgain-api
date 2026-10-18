@@ -20,6 +20,7 @@ import {
   taskAssignees,
   meetingRequests,
   projectMeetings,
+  requestWorkflowLinks,
 } from "../db/schema/project-work.js";
 import { fail } from "../auth/security.js";
 import { uuid, bounded } from "./workspace.service.js";
@@ -70,7 +71,11 @@ export class RequestsService {
   }
   async access(tx: Tx, u: User, pid: string, lock = false) {
     const [member] = await tx
-      .select({ role: pm.accessRole, teamId: projects.teamId })
+      .select({
+        role: pm.accessRole,
+        teamId: projects.teamId,
+        canApproveTasks: pm.canApproveTasks,
+      })
       .from(pm)
       .innerJoin(projects, eq(projects.id, pm.projectId))
       .where(and(eq(pm.projectId, uuid(pid)), eq(pm.userId, u.id)));
@@ -85,21 +90,34 @@ export class RequestsService {
       .select()
       .from(tm)
       .where(and(eq(tm.teamId, member.teamId), eq(tm.userId, u.id)));
-    const canManage =
+    const isDeveloper =
       u.accountType === "team" && member.role !== "client" && !!team;
     return {
-      canManage,
+      isDeveloper,
+      // Legacy response field retained for existing request-detail clients.
+      canManage: isDeveloper,
+      canApproveTasks:
+        isDeveloper &&
+        (member.canApproveTasks ||
+          ["owner", "admin"].includes(team?.permissionRole ?? "")),
       canAssign:
-        canManage && ["owner", "admin"].includes(team?.permissionRole ?? ""),
+        isDeveloper && ["owner", "admin"].includes(team?.permissionRole ?? ""),
     };
   }
-  private async record(tx: Tx, pid: string, rid: string, lock = false) {
+  private async record(
+    tx: Tx,
+    pid: string,
+    rid: string,
+    lock = false,
+    isDeveloper = true,
+  ) {
     const q = tx
       .select()
       .from(r)
       .where(and(eq(r.id, uuid(rid)), eq(r.projectId, pid)));
     const [request] = await (lock ? q.for("update") : q);
-    if (!request) fail(404, "NOT_FOUND", "요청을 찾을 수 없습니다.");
+    if (!request || (!isDeveloper && request.origin !== "customer"))
+      fail(404, "NOT_FOUND", "요청을 찾을 수 없습니다.");
     return request;
   }
   private async output(tx: Tx, request: typeof r.$inferSelect) {
@@ -118,8 +136,36 @@ export class RequestsService {
       .innerJoin(taskAssignees, eq(taskAssignees.taskId, taskRequests.taskId))
       .innerJoin(users, eq(users.id, taskAssignees.userId))
       .where(eq(taskRequests.requestId, request.id));
+    const linkedTasks = await tx
+      .select({ status: projectTasks.status })
+      .from(taskRequests)
+      .innerJoin(projectTasks, eq(projectTasks.id, taskRequests.taskId))
+      .where(eq(taskRequests.requestId, request.id));
+    const [link] = await tx
+      .select()
+      .from(requestWorkflowLinks)
+      .where(eq(requestWorkflowLinks.requestId, request.id));
+    const workflowStage = linkedTasks.length
+      ? linkedTasks.every((x) => x.status === "released")
+        ? "completed"
+        : "in_progress"
+      : link?.meetingId || link?.approvalId
+        ? "review"
+        : "received";
     return {
       ...request,
+      workflowStage,
+      meetingId: link?.meetingId ?? null,
+      meetingTitle: link?.meetingId
+        ? ((
+            await tx
+              .select({ title: projectMeetings.title })
+              .from(projectMeetings)
+              .where(eq(projectMeetings.id, link.meetingId))
+          )[0]?.title ?? null)
+        : null,
+      taskId: link?.taskId ?? null,
+      approvalId: link?.approvalId ?? null,
       creatorName: creator?.name ?? "",
       assignees: [
         ...new Map(
@@ -140,11 +186,16 @@ export class RequestsService {
   }
   async list(u: User, pid: string) {
     return this.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      const access = await this.access(tx, u, pid);
       const rows = await tx
         .select()
         .from(r)
-        .where(eq(r.projectId, pid))
+        .where(
+          and(
+            eq(r.projectId, pid),
+            access.isDeveloper ? undefined : eq(r.origin, "customer"),
+          ),
+        )
         .orderBy(desc(r.createdAt));
       return {
         requests: await Promise.all(rows.map((x) => this.output(tx, x))),
@@ -162,11 +213,25 @@ export class RequestsService {
     )
       fail(400, "VALIDATION_ERROR", "요청 유형과 우선순위를 확인해주세요.");
     return this.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      const access = await this.access(tx, u, pid);
+      if (u.accountType === "team" && !access.isDeveloper)
+        fail(
+          403,
+          "FORBIDDEN",
+          "프로젝트 개발팀만 개발 요청을 작성할 수 있습니다.",
+        );
+      const origin = access.isDeveloper ? "development" : "customer";
+      if (b.origin !== undefined && b.origin !== origin)
+        fail(
+          403,
+          "INVALID_ORIGIN",
+          "개발팀은 개발 요청, 의뢰자는 고객 요청을 작성해주세요.",
+        );
       const [request] = await tx
         .insert(r)
         .values({
           projectId: pid,
+          origin,
           title,
           description,
           type,
@@ -188,7 +253,13 @@ export class RequestsService {
   async detail(u: User, pid: string, rid: string) {
     return this.db.transaction(async (tx) => {
       const permissions = await this.access(tx, u, pid);
-      const request = await this.record(tx, pid, rid);
+      const request = await this.record(
+        tx,
+        pid,
+        rid,
+        false,
+        permissions.isDeveloper,
+      );
       const events = await tx
         .select({
           id: e.id,
@@ -229,10 +300,15 @@ export class RequestsService {
       return {
         workflow: { tasks: workflowTasks, meetings: workflowMeetings },
         request: await this.output(tx, request),
-        events,
+        events: events.map((event) => ({
+          ...event,
+          ...(event.kind === "workflow_stage"
+            ? { workflowStage: event.status }
+            : {}),
+        })),
         attachments: await this.files(tx, pid, rid),
         ...permissions,
-        canUpload: request.createdBy === u.id || permissions.canManage,
+        canUpload: request.createdBy === u.id || permissions.isDeveloper,
       };
     });
   }
@@ -241,12 +317,18 @@ export class RequestsService {
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
       const p = await this.access(tx, u, pid, true);
-      if (!p.canManage)
+      if (!p.isDeveloper)
         fail(403, "FORBIDDEN", "개발팀 참여자만 변경할 수 있습니다.");
       const request = await this.record(tx, pid, rid, true);
       let changed = false;
       if (b.status === undefined && b.assigneeIds === undefined)
         fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
+      if (b.status !== undefined && b.status !== request.status)
+        fail(
+          409,
+          "WORKFLOW_MANAGED",
+          "요청 단계는 회의·승인·업무 진행에 따라 자동으로 변경됩니다.",
+        );
       if (b.status !== undefined) {
         const linked = await tx
           .select({ id: taskRequests.taskId })
@@ -355,8 +437,8 @@ export class RequestsService {
   async comment(u: User, pid: string, rid: string, b: Record<string, unknown>) {
     const body = bounded(b?.body, 5000);
     return this.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
-      await this.record(tx, pid, rid, true);
+      const access = await this.access(tx, u, pid);
+      await this.record(tx, pid, rid, true, access.isDeveloper);
       const [event] = await tx
         .insert(e)
         .values({
@@ -377,8 +459,8 @@ export class RequestsService {
     const names = files.map(validateUpload);
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
-      const request = await this.record(tx, pid, rid, true);
-      if (request.createdBy !== u.id && !access.canManage)
+      const request = await this.record(tx, pid, rid, true, access.isDeveloper);
+      if (request.createdBy !== u.id && !access.isDeveloper)
         fail(403, "FORBIDDEN", "작성자와 개발팀만 첨부할 수 있습니다.");
       const existing = await tx
         .select({ size: f.size })
@@ -413,8 +495,8 @@ export class RequestsService {
   }
   async download(u: User, pid: string, rid: string, fid: string) {
     return this.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
-      await this.record(tx, pid, rid);
+      const access = await this.access(tx, u, pid);
+      await this.record(tx, pid, rid, false, access.isDeveloper);
       const [file] = await tx
         .select()
         .from(f)

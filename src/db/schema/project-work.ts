@@ -36,6 +36,7 @@ export const projectTasks = pgTable(
   "project_tasks",
   {
     ...common(),
+    approvalId: uuid("approval_id"),
     version: uuid("version").notNull().defaultRandom(),
     description: text("description").notNull().default(""),
     status: text("status").notNull().default("todo"),
@@ -265,3 +266,67 @@ export const taskResultEntries = pgTable(
   },
   (t) => [index("task_result_entries_idx").on(t.taskId, t.createdAt)],
 );
+
+// Requests remain in project_requests; these tables store approval snapshots/history only.
+export const taskApprovals = pgTable(
+  "task_approvals",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id),
+    source: text("source").notNull(),
+    meetingId: uuid("meeting_id").references(() => projectMeetings.id),
+    title: text("title").notNull(),
+    status: text("status").notNull().default("pending"),
+    requestedBy: uuid("requested_by")
+      .notNull()
+      .references(() => users.id),
+    plans: jsonb("plans").$type<ApprovalPlan[]>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    check("approval_source_check", sql`${t.source} IN ('meeting','urgent')`),
+    check(
+      "approval_status_check",
+      sql`${t.status} IN ('pending','approved','rejected','cancelled')`,
+    ),
+  ],
+);
+export type ApprovalPlan = {
+  requestId: string;
+  planning: string;
+  uiNotes: string;
+  apiNotes: string;
+  dbNotes: string;
+  priority: string;
+  assigneeIds: string[];
+};
+export const taskApprovalReviewers = pgTable(
+  "task_approval_reviewers",
+  {
+    approvalId: uuid("approval_id")
+      .notNull()
+      .references(() => taskApprovals.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    status: text("status").notNull().default("pending"),
+    note: text("note").notNull().default(""),
+    actedAt: timestamp("acted_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.approvalId, t.userId] })],
+);
+export const requestWorkflowLinks = pgTable("request_workflow_links", {
+  requestId: uuid("request_id")
+    .primaryKey()
+    .references(() => projectRequests.id),
+  meetingId: uuid("meeting_id").references(() => projectMeetings.id),
+  approvalId: uuid("approval_id").references(() => taskApprovals.id),
+  taskId: uuid("task_id").references(() => projectTasks.id),
+});

@@ -84,7 +84,7 @@ test("final meeting completion is idempotent and preserves decisions and linked 
   };
   const service = new ProjectWorkService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: true }) },
+    { access: async () => ({ isDeveloper: true }) },
   );
   service.event = async () => {
     events++;

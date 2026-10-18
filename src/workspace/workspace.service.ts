@@ -187,7 +187,10 @@ export class WorkspaceService {
         canManage: u.accountType === "team" && adminIds.includes(p.teamId),
         members: pms
           .filter((m) => m.m.projectId === p.id)
-          .map((m) => member(m.u, p.teamId, m.m.accessRole)),
+          .map((m) => ({
+            ...member(m.u, p.teamId, m.m.accessRole),
+            canApproveTasks: m.m.canApproveTasks,
+          })),
       })),
       invitations: invs.map(({ i, p }) => ({
         ...i,

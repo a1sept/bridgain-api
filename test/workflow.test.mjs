@@ -172,7 +172,7 @@ test("meeting finalization and task assignment deny client access before touchin
   );
   const work = new ProjectWorkService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: false }) },
+    { access: async () => ({ isDeveloper: false }) },
   );
   const u = { id: "client", displayName: "client", accountType: "client" };
   await assert.rejects(
@@ -196,7 +196,7 @@ test("final meeting cannot be edited or finalized twice", async () => {
   };
   const work = new ProjectWorkService(
     { db: { transaction: (fn) => fn({ select: () => query }) } },
-    { access: async () => ({ canManage: true }) },
+    { access: async () => ({ isDeveloper: true }) },
   );
   await assert.rejects(
     work.saveMeeting(
@@ -208,10 +208,10 @@ test("final meeting cannot be edited or finalized twice", async () => {
     (e) => e.getStatus() === 409,
   );
 });
-test("draft meetings reject assignment and final meetings require requests", async () => {
+test("meetings cannot finalize without approval and reject duplicate requests", async () => {
   const work = new ProjectWorkService(
     { db: { transaction: (fn) => fn({}) } },
-    { access: async () => ({ canManage: true }) },
+    { access: async () => ({ isDeveloper: true }) },
   );
   const user = { id: "developer", accountType: "team" };
   await assert.rejects(
@@ -219,7 +219,7 @@ test("draft meetings reject assignment and final meetings require requests", asy
       decisionStatus: "final",
       requests: [],
     }),
-    (e) => e.getStatus() === 400,
+    (e) => e.getResponse().code === "APPROVAL_REQUIRED",
   );
   await assert.rejects(
     work.saveMeeting(user, "project", {
@@ -296,75 +296,31 @@ function databaseFixture(selections, returned) {
   return { writes, database: { db: { transaction: (fn) => fn(tx) } } };
 }
 const schema = await import("../dist/db/schema/project-work.js");
-test("final meeting generates linked tasks and developer assignments from request plans", async () => {
-  const rid = "abcdef01-1234-4321-abcd-123456789012",
-    uid = "abcdef02-1234-4321-abcd-123456789012";
-  const fixture = databaseFixture(
-    [
-      [{ id: uid }],
-      [{ id: rid }],
-      [{ id: rid, title: "Login request" }],
-      [{ status: "todo" }],
-      [{ id: rid, status: "received" }],
-      [],
-    ],
-    new Map([
-      [
-        schema.projectMeetings,
-        { id: "meeting", title: "Planning", decisionStatus: "final" },
-      ],
-      [schema.projectTasks, { id: "task", title: "Login request" }],
-    ]),
-  );
+test("saving a final meeting cannot create tasks even for administrators", async () => {
+  const fixture = databaseFixture([], new Map());
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ canManage: true }),
+    access: async () => ({ isDeveloper: true, canAssign: true }),
   });
-  await service.saveMeeting({ id: uid, accountType: "team" }, "project", {
-    title: "Planning",
-    scheduledAt: "2026-10-13T10:00:00Z",
-    decisionStatus: "final",
-    requests: [
-      {
-        requestId: rid,
-        planning: "Implement login",
-        uiNotes: "Login form",
-        priority: "high",
-        assigneeIds: [uid],
-      },
-    ],
-  });
-  assert.equal(
-    fixture.writes.filter((w) => w.table === schema.projectTasks).length,
-    1,
+  await assert.rejects(
+    service.saveMeeting({ id: "admin", accountType: "team" }, "project", {
+      decisionStatus: "final",
+      requests: [],
+    }),
+    (e) => e.getResponse().code === "APPROVAL_REQUIRED",
   );
-  assert.equal(
-    fixture.writes.find((w) => w.table === schema.projectTasks).value.priority,
-    "high",
-  );
-  assert.deepEqual(
-    fixture.writes.find((w) => w.table === schema.taskAssignees).value,
-    [{ taskId: "task", userId: uid }],
-  );
-  assert.equal(
-    fixture.writes.find((w) => w.table === schema.meetingRequests).value.taskId,
-    "task",
-  );
-  assert.equal(
-    fixture.writes.find((w) => w.table === schema.taskRequests).value.requestId,
-    rid,
-  );
+  assert.equal(fixture.writes.length, 0);
 });
-test("non-developer assignees are rejected before any writes", async () => {
+test("direct task creation is rejected before any writes", async () => {
   const fixture = databaseFixture([[]], new Map());
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ canManage: true }),
+    access: async () => ({ isDeveloper: true }),
   });
   await assert.rejects(
     service.saveTask({ id: "developer", accountType: "team" }, "project", {
       title: "Task",
       assigneeIds: ["abcdef01-1234-4321-abcd-123456789012"],
     }),
-    (e) => e.getResponse().code === "INVALID_ASSIGNEE",
+    (e) => e.getResponse().code === "APPROVAL_REQUIRED",
   );
   assert.equal(fixture.writes.length, 0);
 });
@@ -386,7 +342,7 @@ test("first edit preserves legacy document contents and stores the new version w
     new Map([[schema.projectDocuments, updated]]),
   );
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ canManage: true }),
+    access: async () => ({ isDeveloper: true }),
   });
   await service.saveDocument(
     { id: "editor", accountType: "team" },

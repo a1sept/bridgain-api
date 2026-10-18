@@ -28,7 +28,7 @@ test("client project members cannot list or create AI sessions", async () => {
   );
   const ai = new AiService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: false }) },
+    { access: async () => ({ isDeveloper: false }) },
     {},
   );
   await assert.rejects(
@@ -66,7 +66,7 @@ test("other developers cannot read or write an unowned session even in the same 
   };
   const ai = new AiService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: true }) },
+    { access: async () => ({ isDeveloper: true }) },
     {},
   );
   const id = "abcdef01-1234-4321-abcd-123456789012";
@@ -100,7 +100,7 @@ test("AI request lookup always uses the session project scope", async () => {
   const ai = new AiService(
     { db: { transaction: (fn) => fn({ select: () => q }) } },
     {
-      access: async () => ({ canManage: true }),
+      access: async () => ({ isDeveloper: true }),
       detail: async (...args) => {
         call = args;
         return { request: {} };
@@ -135,7 +135,18 @@ function approvalFixture(draft, work, extraRows = []) {
     },
   });
   let marked = false;
+  const inserted = [];
   const tx = {
+    insert: (table) => ({
+      values: (value) => {
+        inserted.push({ table, value });
+        return {
+          returning: async () => [
+            { id: "abcdef01-1234-4321-abcd-123456789012", ...value },
+          ],
+        };
+      },
+    }),
     select: () => query(rows.shift()),
     execute: async () => {},
     update: () => ({
@@ -148,32 +159,29 @@ function approvalFixture(draft, work, extraRows = []) {
   };
   const service = new AiService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ canManage: true }) },
+    { access: async () => ({ isDeveloper: true }) },
     work,
   );
-  return { service, tx, marked: () => marked };
+  return { service, tx, inserted, marked: () => marked };
 }
-test("draft approval uses the same transaction for actual work and its applied marker", async () => {
+test("AI task application creates a development request rather than an executable task", async () => {
   const id = "abcdef01-1234-4321-abcd-123456789012";
-  let transaction;
   const fixture = approvalFixture(
-    { id, kind: "task", payload: { title: "Suggested task" }, appliedAt: null },
+    { id, kind: "task", payload: { title: "Task" }, appliedAt: null },
     {
-      saveTask: async (...args) => {
-        transaction = args[5];
-        assert.equal(args[2].status, "todo");
-        assert.deepEqual(args[2].assigneeIds, []);
-        return { task: { id } };
+      saveTask: () => {
+        throw Error("must not create task");
       },
     },
   );
-  await fixture.service.apply(
+  const result = await fixture.service.apply(
     { id: "developer", accountType: "team" },
     id,
     id,
     id,
   );
-  assert.equal(transaction, fixture.tx);
+  assert.equal(result.targetId, id);
+  assert.equal(fixture.inserted[0].value.origin, "development");
   assert.equal(fixture.marked(), true);
 });
 test("repeated approval never creates the same work twice", async () => {
@@ -201,19 +209,18 @@ test("repeated approval never creates the same work twice", async () => {
   assert.equal(result.alreadyApplied, true);
   assert.equal(fixture.marked(), false);
 });
-test("failed work application never marks a draft as applied", async () => {
+test("failed development request creation never marks AI draft applied", async () => {
   const id = "abcdef01-1234-4321-abcd-123456789012";
   const fixture = approvalFixture(
     { id, kind: "task", payload: { title: "Task" }, appliedAt: null },
-    {
-      saveTask: async () => {
-        throw Error("permission changed");
-      },
-    },
+    {},
   );
+  fixture.tx.insert = () => {
+    throw Error("request insert failed");
+  };
   await assert.rejects(
     fixture.service.apply({ id: "developer", accountType: "team" }, id, id, id),
-    /permission changed/,
+    /request insert failed/,
   );
   assert.equal(fixture.marked(), false);
 });

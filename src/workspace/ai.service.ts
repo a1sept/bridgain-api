@@ -8,7 +8,7 @@ import {
   aiMessages as messages,
   aiDrafts as drafts,
 } from "../db/schema/ai.js";
-import { projectRequests } from "../db/schema/requests.js";
+import { projectRequests, requestEvents } from "../db/schema/requests.js";
 import { RequestsService } from "./requests.service.js";
 import { ProjectWorkService, choice, ids } from "./project-work.service.js";
 import { uuid, bounded } from "./workspace.service.js";
@@ -69,7 +69,7 @@ export class AiService {
   ) {}
   private async access(tx: Tx, u: User, pid: string) {
     const p = await this.requests.access(tx, u, pid);
-    if (!p.canManage)
+    if (!p.isDeveloper)
       fail(403, "FORBIDDEN", "개발자만 AI 세션을 사용할 수 있습니다.");
   }
   private async owned(tx: Tx, u: User, pid: string, id: string, lock = false) {
@@ -298,18 +298,32 @@ export class AiService {
       switch (draft.kind) {
         case "note":
           break;
-        case "task":
-          targetId = (
-            await this.work.saveTask(
-              u,
-              pid,
-              { ...b, status: "todo", assigneeIds: [] },
-              undefined,
-              undefined,
-              tx,
-            )
-          ).task.id;
+        case "task": {
+          // AI can propose scope, never authorize execution.
+          const [request] = await tx
+            .insert(projectRequests)
+            .values({
+              projectId: pid,
+              origin: "development",
+              title: bounded(b.title, 160),
+              description: bounded(b.description ?? "", 10000, false),
+              type: "other",
+              priority: "normal",
+              createdBy: u.id,
+            })
+            .returning();
+          await tx
+            .insert(requestEvents)
+            .values({
+              requestId: request.id,
+              kind: "created",
+              status: "received",
+              body: "AI 초안을 개발 요청으로 등록했습니다. 업무화에는 승인이 필요합니다.",
+              actorId: u.id,
+            });
+          targetId = request.id;
           break;
+        }
         case "meeting":
           targetId = (
             await this.work.saveMeeting(
