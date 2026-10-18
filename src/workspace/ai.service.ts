@@ -71,6 +71,18 @@ export class AiService {
     const p = await this.requests.access(tx, u, pid);
     if (!p.isDeveloper)
       fail(403, "FORBIDDEN", "개발자만 AI 세션을 사용할 수 있습니다.");
+    // Historical conversations may contain any of these areas. Revoked reads
+    // must not remain accessible through saved messages or draft payloads.
+    if (
+      !["requests.read", "meetings.read", "documents.read", "tasks.read"].every(
+        (key) => p.permissions.includes(key),
+      )
+    )
+      fail(
+        403,
+        "FORBIDDEN",
+        "AI 작업 공간에는 요청·회의·문서·업무 조회 권한이 모두 필요합니다.",
+      );
   }
   private async owned(tx: Tx, u: User, pid: string, id: string, lock = false) {
     await this.access(tx, u, pid);
@@ -281,6 +293,8 @@ export class AiService {
   async apply(u: User, pid: string, id: string, did: string) {
     // Serialize approval retries with a session-level advisory lock; downstream services retain their own membership checks.
     return this.database.db.transaction(async (tx) => {
+      // Serialize role revocation and applying an AI draft with project writes.
+      await this.requests.access(tx, u, pid, true);
       await this.owned(tx, u, pid, id);
       await tx.execute(
         sql`SELECT pg_advisory_xact_lock(hashtextextended(${id},0))`,
@@ -300,6 +314,9 @@ export class AiService {
           break;
         case "task": {
           // AI can propose scope, never authorize execution.
+          const access = await this.requests.access(tx, u, pid);
+          if (!access.permissions.includes("requests.create"))
+            fail(403, "FORBIDDEN", "개발 요청 작성 권한이 필요합니다.");
           const [request] = await tx
             .insert(projectRequests)
             .values({
@@ -312,15 +329,13 @@ export class AiService {
               createdBy: u.id,
             })
             .returning();
-          await tx
-            .insert(requestEvents)
-            .values({
-              requestId: request.id,
-              kind: "created",
-              status: "received",
-              body: "AI 초안을 개발 요청으로 등록했습니다. 업무화에는 승인이 필요합니다.",
-              actorId: u.id,
-            });
+          await tx.insert(requestEvents).values({
+            requestId: request.id,
+            kind: "created",
+            status: "received",
+            body: "AI 초안을 개발 요청으로 등록했습니다. 업무화에는 승인이 필요합니다.",
+            actorId: u.id,
+          });
           targetId = request.id;
           break;
         }

@@ -19,7 +19,10 @@ import {
   taskAssignees,
   type ApprovalPlan,
 } from "../db/schema/project-work.js";
-import { RequestsService } from "./requests.service.js";
+import {
+  RequestsService,
+  requireProjectPermission,
+} from "./requests.service.js";
 import { ids, choice } from "./project-work.service.js";
 import { uuid, bounded } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
@@ -54,12 +57,23 @@ export class ApprovalService {
           eq(users.status, "active"),
         ),
       );
-    return rows.filter(
-      (x) =>
+    const eligible = [];
+    for (const x of rows) {
+      if (
         x.accessRole !== "client" &&
-        (x.canApproveTasks || ["owner", "admin"].includes(x.role)),
-    );
+        (
+          await this.requests.access(
+            tx,
+            { id: x.userId, displayName: x.displayName, accountType: "team" },
+            pid,
+          )
+        ).canApproveTasks
+      )
+        eligible.push(x);
+    }
+    return eligible;
   }
+
   private async output(tx: Tx, a: typeof approvals.$inferSelect, u: User) {
     const approvers = await tx
       .select({
@@ -116,8 +130,11 @@ export class ApprovalService {
         fail(403, "FORBIDDEN", "개발팀만 접근할 수 있습니다.");
       if (pid) {
         const p = await this.requests.access(tx, u, pid);
-        if (!p.isDeveloper)
-          fail(403, "FORBIDDEN", "개발팀만 접근할 수 있습니다.");
+        if (
+          !p.isDeveloper ||
+          (!p.permissions.includes("requests.read") && !p.canApproveTasks)
+        )
+          fail(403, "FORBIDDEN", "승인 내역을 조회할 권한이 없습니다.");
       }
       const memberships = await tx.select().from(pm).where(eq(pm.userId, u.id));
       const projectIds = pid
@@ -135,7 +152,12 @@ export class ApprovalService {
       const visible = [];
       for (const row of rows) {
         const access = await this.requests.access(tx, u, row.projectId);
-        if (access.isDeveloper) visible.push(row);
+        if (
+          access.isDeveloper &&
+          (access.permissions.includes("requests.read") ||
+            access.canApproveTasks)
+        )
+          visible.push(row);
       }
       const out = await Promise.all(visible.map((a) => this.output(tx, a, u)));
       return {
@@ -162,7 +184,15 @@ export class ApprovalService {
       const p = await this.requests.access(tx, u, pid, true);
       if (!p.isDeveloper)
         fail(403, "FORBIDDEN", "개발팀만 승인 요청할 수 있습니다.");
+      // Submission freezes assignees into the executable approval plan.
+      // Legacy members retain the existing proposal flow until roles are configured.
+      if (p.rolesConfigured) requireProjectPermission(p, "tasks.assign");
       const source = choice(b.source, ["meeting", "urgent"]);
+      requireProjectPermission(
+        p,
+        source === "meeting" ? "meetings.update" : "requests.create",
+      );
+      requireProjectPermission(p, "requests.read");
       const approverIds = ids(b.approverIds);
       if (!approverIds.length)
         fail(400, "APPROVER_REQUIRED", "필수 승인자를 선택해주세요.");
@@ -231,6 +261,19 @@ export class ApprovalService {
           ),
         );
       for (const plan of plans) {
+        for (const id of plan.assigneeIds) {
+          const memberAccess = await this.requests.access(
+            tx,
+            { id, displayName: "", accountType: "team" },
+            pid,
+          );
+          if (!memberAccess.permissions.includes("tasks.progress"))
+            fail(
+              400,
+              "INVALID_ASSIGNEE",
+              "업무 진행 권한이 있는 담당자를 지정해주세요.",
+            );
+        }
         if (
           !plan.assigneeIds.length ||
           plan.assigneeIds.some(
@@ -325,15 +368,13 @@ export class ApprovalService {
             target: links.requestId,
             set: { meetingId, approvalId: a.id },
           });
-        await tx
-          .insert(requestEvents)
-          .values({
-            requestId: plan.requestId,
-            kind: "workflow_stage",
-            status: "review",
-            body: "업무화 승인을 요청했습니다.",
-            actorId: u.id,
-          });
+        await tx.insert(requestEvents).values({
+          requestId: plan.requestId,
+          kind: "workflow_stage",
+          status: "review",
+          body: "업무화 승인을 요청했습니다.",
+          actorId: u.id,
+        });
       }
       return { approval: await this.output(tx, a, u) };
     });
@@ -341,7 +382,8 @@ export class ApprovalService {
   async act(u: User, pid: string, id: string, b: Record<string, unknown>) {
     return this.database.db.transaction(async (tx) => {
       const p = await this.requests.access(tx, u, pid, true);
-      if (!p.isDeveloper) fail(403, "FORBIDDEN", "개발팀만 접근할 수 있습니다.");
+      if (!p.isDeveloper)
+        fail(403, "FORBIDDEN", "개발팀만 접근할 수 있습니다.");
       const [a] = await tx
         .select()
         .from(approvals)
@@ -433,6 +475,19 @@ export class ApprovalService {
           );
 
         for (const plan of a.plans) {
+          for (const id of plan.assigneeIds) {
+            const memberAccess = await this.requests.access(
+              tx,
+              { id, displayName: "", accountType: "team" },
+              pid,
+            );
+            if (!memberAccess.permissions.includes("tasks.progress"))
+              fail(
+                409,
+                "ASSIGNEE_CHANGED",
+                "담당자의 업무 진행 권한이 변경되었습니다.",
+              );
+          }
           const [request] = await tx
             .select()
             .from(projectRequests)
@@ -484,15 +539,13 @@ export class ApprovalService {
                   eq(meetingRequests.requestId, plan.requestId),
                 ),
               );
-          await tx
-            .insert(requestEvents)
-            .values({
-              requestId: plan.requestId,
-              kind: "workflow_stage",
-              status: "in_progress",
-              body: "필수 승인자 전원이 승인하여 업무가 생성되었습니다.",
-              actorId: u.id,
-            });
+          await tx.insert(requestEvents).values({
+            requestId: plan.requestId,
+            kind: "workflow_stage",
+            status: "in_progress",
+            body: "필수 승인자 전원이 승인하여 업무가 생성되었습니다.",
+            actorId: u.id,
+          });
         }
         if (a.meetingId)
           await tx
@@ -507,15 +560,13 @@ export class ApprovalService {
           .where(eq(links.approvalId, id));
         if (!a.meetingId)
           for (const plan of a.plans)
-            await tx
-              .insert(requestEvents)
-              .values({
-                requestId: plan.requestId,
-                kind: "workflow_stage",
-                status: "received",
-                body: "승인 절차가 종료되어 요청 접수 단계로 돌아갔습니다.",
-                actorId: u.id,
-              });
+            await tx.insert(requestEvents).values({
+              requestId: plan.requestId,
+              kind: "workflow_stage",
+              status: "received",
+              body: "승인 절차가 종료되어 요청 접수 단계로 돌아갔습니다.",
+              actorId: u.id,
+            });
       }
       const [updated] = await tx
         .update(approvals)
@@ -533,8 +584,13 @@ export class ApprovalService {
   ) {
     return this.database.db.transaction(async (tx) => {
       const p = await this.requests.access(tx, u, pid, true);
-      if (!p.canAssign)
-        fail(403, "FORBIDDEN", "관리자만 승인권한을 변경할 수 있습니다.");
+      requireProjectPermission(p, "roles.manage");
+      if (p.rolesConfigured)
+        fail(
+          409,
+          "ROLES_MANAGED",
+          "역할·권한 설정에서 승인 권한을 변경해주세요.",
+        );
       if (typeof b.canApproveTasks !== "boolean")
         fail(400, "VALIDATION_ERROR", "승인권한을 확인해주세요.");
       const [m] = await tx

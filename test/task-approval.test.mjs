@@ -1,3 +1,4 @@
+import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ApprovalService } from "../dist/workspace/approval.service.js";
@@ -49,7 +50,12 @@ function fixture(rows) {
 
   const database = { db: { transaction: (fn) => fn(tx) } };
   const service = new ApprovalService(database, {
-    access: async () => ({ isDeveloper: true, canAssign: false }),
+    access: async () => ({
+      isDeveloper: true,
+      permissions: [...allProjectPermissions],
+      canApproveTasks: true,
+      canAssign: false,
+    }),
   });
   return { service, database, writes };
 }
@@ -179,4 +185,35 @@ test("guessed development request IDs are hidden from customer detail, comments 
     );
     assert.equal(f.writes.length, 0);
   }
+});
+
+test("configured roles cannot submit assigned approval plans without task assignment permission", async () => {
+  const service = new ApprovalService(
+    {
+      db: {
+        transaction: (fn) =>
+          fn(
+            new Proxy(
+              {},
+              {
+                get() {
+                  throw Error("Unexpected data access");
+                },
+              },
+            ),
+          ),
+      },
+    },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        rolesConfigured: true,
+        permissions: ["requests.read", "requests.create"],
+      }),
+    },
+  );
+  await assert.rejects(
+    service.create(user, id, { source: "urgent" }),
+    (e) => e.getStatus() === 403,
+  );
 });

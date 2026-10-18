@@ -7,3 +7,5 @@ export * from "./project-work.js";
 
 export * from "./ai.js";
 export * from './github.js';
+
+export * from "./project-roles.js";

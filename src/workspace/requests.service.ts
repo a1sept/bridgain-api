@@ -1,3 +1,4 @@
+import { resolveProjectPermissions } from "./project-roles.service.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, inArray, desc, asc, sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -63,6 +64,13 @@ export function validateUpload(file: Upload) {
     fail(400, "INVALID_FILE", "PDF, PNG, JPG 파일만 첨부할 수 있습니다.");
   return bounded(file.originalname.replace(/[\\/\x00-\x1f\x7f]/g, "_"), 200);
 }
+export function requireProjectPermission(
+  access: { isDeveloper: boolean; permissions: string[] },
+  permission: string,
+) {
+  if (access.isDeveloper && !access.permissions.includes(permission))
+    fail(403, "FORBIDDEN", "이 작업에 필요한 프로젝트 권한이 없습니다.");
+}
 @Injectable()
 export class RequestsService {
   constructor(private readonly database: DatabaseService) {}
@@ -70,40 +78,9 @@ export class RequestsService {
     return this.database.db;
   }
   async access(tx: Tx, u: User, pid: string, lock = false) {
-    const [member] = await tx
-      .select({
-        role: pm.accessRole,
-        teamId: projects.teamId,
-        canApproveTasks: pm.canApproveTasks,
-      })
-      .from(pm)
-      .innerJoin(projects, eq(projects.id, pm.projectId))
-      .where(and(eq(pm.projectId, uuid(pid)), eq(pm.userId, u.id)));
-    if (!member) fail(404, "NOT_FOUND", "프로젝트를 찾을 수 없습니다.");
-    if (lock)
-      await tx
-        .select()
-        .from(teams)
-        .where(eq(teams.id, member.teamId))
-        .for("update");
-    const [team] = await tx
-      .select()
-      .from(tm)
-      .where(and(eq(tm.teamId, member.teamId), eq(tm.userId, u.id)));
-    const isDeveloper =
-      u.accountType === "team" && member.role !== "client" && !!team;
-    return {
-      isDeveloper,
-      // Legacy response field retained for existing request-detail clients.
-      canManage: isDeveloper,
-      canApproveTasks:
-        isDeveloper &&
-        (member.canApproveTasks ||
-          ["owner", "admin"].includes(team?.permissionRole ?? "")),
-      canAssign:
-        isDeveloper && ["owner", "admin"].includes(team?.permissionRole ?? ""),
-    };
+    return resolveProjectPermissions(tx, u, pid, lock);
   }
+
   private async record(
     tx: Tx,
     pid: string,
@@ -187,6 +164,7 @@ export class RequestsService {
   async list(u: User, pid: string) {
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
+      requireProjectPermission(access, "requests.read");
       const rows = await tx
         .select()
         .from(r)
@@ -214,6 +192,8 @@ export class RequestsService {
       fail(400, "VALIDATION_ERROR", "요청 유형과 우선순위를 확인해주세요.");
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
+      requireProjectPermission(access, "requests.read");
+      requireProjectPermission(access, "requests.create");
       if (u.accountType === "team" && !access.isDeveloper)
         fail(
           403,
@@ -253,6 +233,7 @@ export class RequestsService {
   async detail(u: User, pid: string, rid: string) {
     return this.db.transaction(async (tx) => {
       const permissions = await this.access(tx, u, pid);
+      requireProjectPermission(permissions, "requests.read");
       const request = await this.record(
         tx,
         pid,
@@ -308,7 +289,10 @@ export class RequestsService {
         })),
         attachments: await this.files(tx, pid, rid),
         ...permissions,
-        canUpload: request.createdBy === u.id || permissions.isDeveloper,
+        canUpload:
+          (request.createdBy === u.id || permissions.isDeveloper) &&
+          (!permissions.isDeveloper ||
+            permissions.permissions.includes("requests.create")),
       };
     });
   }
@@ -317,6 +301,7 @@ export class RequestsService {
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
       const p = await this.access(tx, u, pid, true);
+      requireProjectPermission(p, "requests.read");
       if (!p.isDeveloper)
         fail(403, "FORBIDDEN", "개발팀 참여자만 변경할 수 있습니다.");
       const request = await this.record(tx, pid, rid, true);
@@ -438,6 +423,8 @@ export class RequestsService {
     const body = bounded(b?.body, 5000);
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
+      requireProjectPermission(access, "requests.read");
+      requireProjectPermission(access, "requests.create");
       await this.record(tx, pid, rid, true, access.isDeveloper);
       const [event] = await tx
         .insert(e)
@@ -459,6 +446,8 @@ export class RequestsService {
     const names = files.map(validateUpload);
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
+      requireProjectPermission(access, "requests.read");
+      requireProjectPermission(access, "requests.create");
       const request = await this.record(tx, pid, rid, true, access.isDeveloper);
       if (request.createdBy !== u.id && !access.isDeveloper)
         fail(403, "FORBIDDEN", "작성자와 개발팀만 첨부할 수 있습니다.");
@@ -496,6 +485,7 @@ export class RequestsService {
   async download(u: User, pid: string, rid: string, fid: string) {
     return this.db.transaction(async (tx) => {
       const access = await this.access(tx, u, pid);
+      requireProjectPermission(access, "requests.read");
       await this.record(tx, pid, rid, false, access.isDeveloper);
       const [file] = await tx
         .select()

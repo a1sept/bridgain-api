@@ -27,7 +27,10 @@ import {
   projectDocuments as documents,
   projectActivity as activity,
 } from "../db/schema/project-work.js";
-import { RequestsService } from "./requests.service.js";
+import {
+  RequestsService,
+  requireProjectPermission,
+} from "./requests.service.js";
 import { bounded, uuid } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
 import type { GitEvent } from "./git-events.controller.js";
@@ -134,10 +137,18 @@ export class ProjectWorkService {
   private run<T>(fn: (tx: Tx) => Promise<T>, existingTx?: Tx) {
     return existingTx ? fn(existingTx) : this.database.db.transaction(fn);
   }
-  private async access(tx: Tx, u: User, pid: string, lock = false) {
+  private async access(
+    tx: Tx,
+    u: User,
+    pid: string,
+    lock = false,
+    permission = "tasks.read",
+  ) {
     const access = await this.requests.access(tx, u, pid, lock);
+    requireProjectPermission(access, permission);
     if (!access.isDeveloper)
       fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
+    return access;
   }
   private async event(
     tx: Tx,
@@ -206,20 +217,27 @@ export class ProjectWorkService {
         );
     }
   }
-  private async taskOutput(tx: Tx, row: typeof tasks.$inferSelect) {
+  private async taskOutput(
+    tx: Tx,
+    row: typeof tasks.$inferSelect,
+    permissions?: string[],
+  ) {
     const assignees = await tx
       .select({ userId: users.id, displayName: users.displayName })
       .from(taskAssignees)
       .innerJoin(users, eq(users.id, taskAssignees.userId))
       .where(eq(taskAssignees.taskId, row.id));
-    const requests = await tx
-      .select({ id: projectRequests.id, title: projectRequests.title })
-      .from(taskRequests)
-      .innerJoin(
-        projectRequests,
-        eq(projectRequests.id, taskRequests.requestId),
-      )
-      .where(eq(taskRequests.taskId, row.id));
+    const requests =
+      permissions && !permissions.includes("requests.read")
+        ? []
+        : await tx
+            .select({ id: projectRequests.id, title: projectRequests.title })
+            .from(taskRequests)
+            .innerJoin(
+              projectRequests,
+              eq(projectRequests.id, taskRequests.requestId),
+            )
+            .where(eq(taskRequests.taskId, row.id));
     return {
       ...row,
       resultEntries: await tx
@@ -228,17 +246,20 @@ export class ProjectWorkService {
         .innerJoin(users, eq(users.id, taskResultEntries.actorId))
         .where(eq(taskResultEntries.taskId, row.id))
         .orderBy(desc(taskResultEntries.createdAt)),
-      documentVersions: await tx
-        .select({
-          id: documentVersions.id,
-          documentId: documentVersions.documentId,
-          title: documentVersions.title,
-          changeSummary: documentVersions.changeSummary,
-          createdAt: documentVersions.createdAt,
-        })
-        .from(documentVersions)
-        .where(eq(documentVersions.taskId, row.id))
-        .orderBy(desc(documentVersions.createdAt)),
+      documentVersions:
+        permissions && !permissions.includes("documents.read")
+          ? []
+          : await tx
+              .select({
+                id: documentVersions.id,
+                documentId: documentVersions.documentId,
+                title: documentVersions.title,
+                changeSummary: documentVersions.changeSummary,
+                createdAt: documentVersions.createdAt,
+              })
+              .from(documentVersions)
+              .where(eq(documentVersions.taskId, row.id))
+              .orderBy(desc(documentVersions.createdAt)),
       assignees,
       requests,
       assigneeIds: assignees.map((x) => x.userId),
@@ -247,14 +268,16 @@ export class ProjectWorkService {
   }
   async listTasks(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      const access = await this.access(tx, u, pid);
       const rows = await tx
         .select()
         .from(tasks)
         .where(eq(tasks.projectId, pid))
         .orderBy(desc(tasks.createdAt));
       return {
-        tasks: await Promise.all(rows.map((r) => this.taskOutput(tx, r))),
+        tasks: await Promise.all(
+          rows.map((r) => this.taskOutput(tx, r, access.permissions)),
+        ),
       };
     });
   }
@@ -267,7 +290,16 @@ export class ProjectWorkService {
     existingTx?: Tx,
   ) {
     return this.run(async (tx) => {
-      await this.access(tx, u, pid, true);
+      const taskAccess = await this.requests.access(tx, u, pid, true);
+      if (!taskAccess.isDeveloper)
+        fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
+      requireProjectPermission(
+        taskAccess,
+        gitEvent?.kind === "merge" &&
+          taskAccess.permissions.includes("approvals.merge")
+          ? "approvals.merge"
+          : "tasks.progress",
+      );
       if (!b || typeof b !== "object" || Array.isArray(b))
         fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       if (!id)
@@ -308,7 +340,10 @@ export class ProjectWorkService {
                 old.mergeCommit,
               )))
       )
-        return { task: await this.taskOutput(tx, old), ignored: true };
+        return {
+          task: await this.taskOutput(tx, old, taskAccess.permissions),
+          ignored: true,
+        };
       if (
         old?.status === "released" &&
         b.status !== undefined &&
@@ -654,7 +689,7 @@ export class ProjectWorkService {
       await this.syncRequests(tx, u, pid, [
         ...new Set([...requestIds, ...(current?.requestIds ?? [])]),
       ]);
-      return { task: await this.taskOutput(tx, row) };
+      return { task: await this.taskOutput(tx, row, taskAccess.permissions) };
     }, existingTx).catch((error: unknown) => {
       const wrapped = error as {
         code?: string;
@@ -676,7 +711,7 @@ export class ProjectWorkService {
   }
   async listResultEntries(u: User, pid: string, id: string) {
     return this.database.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      await this.access(tx, u, pid, false, "tasks.read");
       const [task] = await tx
         .select()
         .from(tasks)
@@ -702,7 +737,7 @@ export class ProjectWorkService {
     if (!b || typeof b !== "object" || Array.isArray(b))
       fail(400, "VALIDATION_ERROR", "추가할 기록을 확인해주세요.");
     return this.run(async (tx) => {
-      await this.access(tx, u, pid, true);
+      await this.access(tx, u, pid, true, "tasks.progress");
       const [task] = await tx
         .select()
         .from(tasks)
@@ -758,7 +793,7 @@ export class ProjectWorkService {
   }
   async listMeetings(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      await this.access(tx, u, pid, false, "meetings.read");
       const rows = await tx
         .select()
         .from(meetings)
@@ -785,7 +820,13 @@ export class ProjectWorkService {
     existingTx?: Tx,
   ) {
     return this.run(async (tx) => {
-      await this.access(tx, u, pid, true);
+      await this.access(
+        tx,
+        u,
+        pid,
+        true,
+        id ? "meetings.update" : "meetings.create",
+      );
       if (!b || typeof b !== "object" || Array.isArray(b))
         fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       let old: typeof meetings.$inferSelect | undefined;
@@ -942,14 +983,12 @@ export class ProjectWorkService {
               "REQUEST_MEETING_LINKED",
               `이 요청은 '${sourceMeeting.title}' 회의에 연결되어 있습니다. 기존 회의에서 제외하고 이동하려면 확인해주세요. (${link.meetingId})`,
             );
-          await tx
-            .insert(requestEvents)
-            .values({
-              requestId: plan.requestId,
-              kind: "meeting_transfer",
-              body: "연결 회의가 변경되었습니다.",
-              actorId: u.id,
-            });
+          await tx.insert(requestEvents).values({
+            requestId: plan.requestId,
+            kind: "meeting_transfer",
+            body: "연결 회의가 변경되었습니다.",
+            actorId: u.id,
+          });
           // Keep old notes in history, but remove the current association.
           await tx.insert(activity).values({
             projectId: pid,
@@ -1037,15 +1076,13 @@ export class ProjectWorkService {
       for (const removed of previous.filter(
         (x) => !plans.some((p) => p.requestId === x.requestId),
       ))
-        await tx
-          .insert(requestEvents)
-          .values({
-            requestId: removed.requestId,
-            kind: "workflow_stage",
-            status: "received",
-            body: "회의 연결이 해제되어 요청 접수 단계로 돌아갔습니다.",
-            actorId: u.id,
-          });
+        await tx.insert(requestEvents).values({
+          requestId: removed.requestId,
+          kind: "workflow_stage",
+          status: "received",
+          body: "회의 연결이 해제되어 요청 접수 단계로 돌아갔습니다.",
+          actorId: u.id,
+        });
       if (old)
         await tx
           .update(requestWorkflowLinks)
@@ -1064,15 +1101,13 @@ export class ProjectWorkService {
             target: requestWorkflowLinks.requestId,
             set: { meetingId: row.id, approvalId: null },
           });
-        await tx
-          .insert(requestEvents)
-          .values({
-            requestId: plan.requestId,
-            kind: "workflow_stage",
-            status: "review",
-            body: "회의 검토 단계입니다.",
-            actorId: u.id,
-          });
+        await tx.insert(requestEvents).values({
+          requestId: plan.requestId,
+          kind: "workflow_stage",
+          status: "review",
+          body: "회의 검토 단계입니다.",
+          actorId: u.id,
+        });
       }
       for (const plan of plans) {
         let taskId: string | null = null;
@@ -1093,7 +1128,7 @@ export class ProjectWorkService {
   }
   async listDocuments(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      await this.access(tx, u, pid, false, "documents.read");
       const rows = await tx
         .select({ document: documents, creatorName: users.displayName })
         .from(documents)
@@ -1134,7 +1169,13 @@ export class ProjectWorkService {
     existingTx?: Tx,
   ) {
     return this.run(async (tx) => {
-      await this.access(tx, u, pid, true);
+      await this.access(
+        tx,
+        u,
+        pid,
+        true,
+        id ? "documents.update" : "documents.create",
+      );
       if (!b || typeof b !== "object" || Array.isArray(b))
         fail(400, "VALIDATION_ERROR", "변경 내용을 확인해주세요.");
       let old: typeof documents.$inferSelect | undefined;
@@ -1346,7 +1387,7 @@ export class ProjectWorkService {
   }
   async listActivity(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
-      await this.access(tx, u, pid);
+      const access = await this.access(tx, u, pid, false, "activity.read");
       const events = await tx
         .select({
           id: activity.id,
@@ -1361,29 +1402,45 @@ export class ProjectWorkService {
         .where(eq(activity.projectId, pid))
         .orderBy(desc(activity.createdAt))
         .limit(100);
-      const requests = await tx
-        .select({
-          id: requestEvents.id,
-          entityId: requestEvents.requestId,
-          kind: requestEvents.kind,
-          body: requestEvents.body,
-          createdAt: requestEvents.createdAt,
-          actorName: users.displayName,
-          title: projectRequests.title,
-          status: requestEvents.status,
-        })
-        .from(requestEvents)
-        .innerJoin(
-          projectRequests,
-          eq(projectRequests.id, requestEvents.requestId),
-        )
-        .innerJoin(users, eq(users.id, requestEvents.actorId))
-        .where(eq(projectRequests.projectId, pid))
-        .orderBy(desc(requestEvents.createdAt))
-        .limit(100);
+      const requests = !access.permissions.includes("requests.read")
+        ? []
+        : await tx
+            .select({
+              id: requestEvents.id,
+              entityId: requestEvents.requestId,
+              kind: requestEvents.kind,
+              body: requestEvents.body,
+              createdAt: requestEvents.createdAt,
+              actorName: users.displayName,
+              title: projectRequests.title,
+              status: requestEvents.status,
+            })
+            .from(requestEvents)
+            .innerJoin(
+              projectRequests,
+              eq(projectRequests.id, requestEvents.requestId),
+            )
+            .innerJoin(users, eq(users.id, requestEvents.actorId))
+            .where(eq(projectRequests.projectId, pid))
+            .orderBy(desc(requestEvents.createdAt))
+            .limit(100);
       return {
         events: [
-          ...events,
+          ...events.filter((e) => {
+            if (e.kind === "request_transferred")
+              return (
+                access.permissions.includes("meetings.read") &&
+                access.permissions.includes("requests.read")
+              );
+            if (e.kind.startsWith("task_"))
+              return access.permissions.includes("tasks.read");
+            if (e.kind.startsWith("meeting_"))
+              return access.permissions.includes("meetings.read");
+            if (e.kind.startsWith("document_"))
+              return access.permissions.includes("documents.read");
+            // New event types require an explicit visibility mapping before exposure.
+            return false;
+          }),
           ...requests.map((e) => ({
             ...e,
             kind: `request_${e.kind}`,

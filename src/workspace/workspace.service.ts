@@ -1,3 +1,5 @@
+import { projectRoles } from "../db/schema/project-roles.js";
+import { resolveProjectPermissions } from "./project-roles.service.js";
 import { repositoryRelations } from "./submodules.js";
 import { randomUUID } from "node:crypto";
 import { projectRepositories } from "./project-repositories.js";
@@ -75,7 +77,12 @@ export class WorkspaceService {
     if (u.accountType !== "team")
       fail(403, "FORBIDDEN", "개발팀 계정만 사용할 수 있습니다.");
   }
-  private async manager(tx: Tx, u: User, projectId: string) {
+  private async manager(
+    tx: Tx,
+    u: User,
+    projectId: string,
+    permission = "members.manage",
+  ) {
     this.teamUser(u);
     const [p] = await tx
       .select()
@@ -91,16 +98,19 @@ export class WorkspaceService {
       .select()
       .from(pm)
       .where(and(eq(pm.projectId, p.id), eq(pm.userId, u.id)));
-    if (!t || !m || !["owner", "admin"].includes(t.permissionRole))
+    const access = await resolveProjectPermissions(tx, u, p.id);
+    if (
+      !t ||
+      !m ||
+      !access.isDeveloper ||
+      !access.permissions.includes(permission)
+    )
       fail(403, "FORBIDDEN", "프로젝트 관리 권한이 필요합니다.");
     return p;
   }
   async snapshot(u: User) {
     const mine = await this.db.select().from(tm).where(eq(tm.userId, u.id));
     const teamIds = mine.map((t) => t.teamId);
-    const adminIds = mine
-      .filter((t) => ["owner", "admin"].includes(t.permissionRole))
-      .map((t) => t.teamId);
     const joined = await this.db.select().from(pm).where(eq(pm.userId, u.id));
     const pids = joined.map((p) => p.projectId);
     const ps = pids.length
@@ -145,6 +155,24 @@ export class WorkspaceService {
     const ts = teamIds.length
       ? await this.db.select().from(teams).where(inArray(teams.id, teamIds))
       : [];
+    const projectAccess = new Map(
+      await Promise.all(
+        ps.map(
+          async (p) =>
+            [
+              p.id,
+              await this.db.transaction((tx) =>
+                resolveProjectPermissions(tx, u, p.id),
+              ),
+            ] as const,
+        ),
+      ),
+    );
+    const managedPids = ps
+      .filter((p) =>
+        projectAccess.get(p.id)!.permissions.includes("members.manage"),
+      )
+      .map((p) => p.id);
     const invs = await this.db
       .select({ i: invitations, p: projects })
       .from(invitations)
@@ -153,12 +181,7 @@ export class WorkspaceService {
         or(
           eq(invitations.inviteeId, u.id),
           eq(invitations.inviterId, u.id),
-          visiblePids.length && adminIds.length
-            ? and(
-                inArray(projects.id, visiblePids),
-                inArray(projects.teamId, adminIds),
-              )
-            : undefined,
+          managedPids.length ? inArray(projects.id, managedPids) : undefined,
         ),
       );
     const ids = [
@@ -166,7 +189,11 @@ export class WorkspaceService {
     ];
     const people = ids.length
       ? await this.db
-          .select({ id: users.id, displayName: users.displayName })
+          .select({
+            id: users.id,
+            displayName: users.displayName,
+            accountType: users.accountType,
+          })
           .from(users)
           .where(inArray(users.id, ids))
       : [];
@@ -184,7 +211,17 @@ export class WorkspaceService {
         ...(u.accountType === "team"
           ? { repositoryUrls, repositoryRelations }
           : {}),
-        canManage: u.accountType === "team" && adminIds.includes(p.teamId),
+        canManage: projectAccess
+          .get(p.id)!
+          .permissions.includes("members.manage"),
+        ...(u.accountType === "team"
+          ? {
+              permissions: projectAccess.get(p.id)!.permissions,
+              canManageRoles: projectAccess.get(p.id)!.canManageRoles,
+              isOwner: projectAccess.get(p.id)!.isOwner,
+              rolesConfigured: projectAccess.get(p.id)!.rolesConfigured,
+            }
+          : {}),
         members: pms
           .filter((m) => m.m.projectId === p.id)
           .map((m) => ({
@@ -200,6 +237,8 @@ export class WorkspaceService {
           people.find((x) => x.id === i.inviterId)?.displayName ?? "",
         inviteeName:
           people.find((x) => x.id === i.inviteeId)?.displayName ?? "",
+        inviteeAccountType:
+          people.find((x) => x.id === i.inviteeId)?.accountType ?? null,
         direction: i.inviteeId === u.id ? "received" : "sent",
       })),
     };
@@ -373,7 +412,7 @@ export class WorkspaceService {
     if (!Object.keys(patch).length)
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
-      const existing = await this.manager(tx, u, id);
+      const existing = await this.manager(tx, u, id, "project.settings");
       if (patch.repositoryUrls && patch.repositoryRelations === undefined) {
         const selected = new Set(
           patch.repositoryUrls.map((url) => url.toLowerCase()),
@@ -486,13 +525,19 @@ export class WorkspaceService {
           .where(
             and(eq(pm.projectId, i.projectId), eq(pm.userId, i.inviterId)),
           );
+        const inviterAccess =
+          inviterProject && inviter
+            ? await resolveProjectPermissions(
+                tx,
+                { id: i.inviterId, accountType: inviter.accountType },
+                i.projectId,
+              )
+            : null;
         if (
-          !invitationAvailable(
-            inviter?.status,
-            inviter?.accountType,
-            inviterTeam?.permissionRole,
-            Boolean(inviterProject),
-          )
+          inviter?.status !== "active" ||
+          inviter?.accountType !== "team" ||
+          !inviterTeam ||
+          !inviterAccess?.permissions.includes("members.manage")
         )
           fail(
             409,
@@ -512,9 +557,15 @@ export class WorkspaceService {
               permissionRole: "member",
             })
             .onConflictDoNothing();
+        const [configuredRole] = await tx
+          .select({ id: projectRoles.id })
+          .from(projectRoles)
+          .where(eq(projectRoles.projectId, p.id))
+          .limit(1);
         await tx
           .insert(pm)
           .values({
+            rolesConfigured: u.accountType === "team" && !!configuredRole,
             projectId: p.id,
             userId: u.id,
             accessRole: u.accountType === "team" ? "contributor" : "client",

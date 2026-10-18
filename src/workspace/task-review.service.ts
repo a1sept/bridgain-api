@@ -9,7 +9,10 @@ import {
 } from "../db/schema/project-work.js";
 import { teams, projects } from "../db/schema/workspace.js";
 import { users } from "../db/schema/auth.js";
-import { RequestsService } from "./requests.service.js";
+import {
+  RequestsService,
+  requireProjectPermission,
+} from "./requests.service.js";
 import { ProjectWorkService } from "./project-work.service.js";
 import { bounded, uuid } from "./workspace.service.js";
 import { fail } from "../auth/security.js";
@@ -113,6 +116,7 @@ export class TaskReviewService {
   async history(u: User, pid: string, id: string) {
     return this.database.db.transaction(async (tx) => {
       const access = await this.requests.access(tx, u, pid);
+      requireProjectPermission(access, "tasks.read");
       if (!access.isDeveloper)
         fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
       const [task] = await tx
@@ -153,6 +157,13 @@ export class TaskReviewService {
     return this.database.db.transaction(async (tx) => {
       // Same team lock as membership edits/task updates: revocation and merge cannot race.
       const access = await this.requests.access(tx, u, pid, true);
+      requireProjectPermission(access, "tasks.read");
+      if (action === "request")
+        requireProjectPermission(access, "tasks.progress");
+      if (action === "merge" && !access.permissions.includes("approvals.merge"))
+        requireProjectPermission(access, "tasks.progress");
+      if (["approve", "changes_requested"].includes(action as string))
+        requireProjectPermission(access, "approvals.merge");
       if (!access.isDeveloper)
         fail(403, "FORBIDDEN", "프로젝트 개발팀만 접근할 수 있습니다.");
       const [task] = await tx

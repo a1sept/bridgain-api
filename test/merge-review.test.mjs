@@ -1,3 +1,4 @@
+import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TaskReviewService } from "../dist/workspace/task-review.service.js";
@@ -13,7 +14,10 @@ import {
   taskReviewEvents,
   taskResultEntries,
 } from "../dist/db/schema/project-work.js";
-import { projectMemberships } from "../dist/db/schema/workspace.js";
+import {
+  projectMemberships,
+  teamMemberships,
+} from "../dist/db/schema/workspace.js";
 const pid = "00000000-0000-4000-8000-000000000001";
 const id = "00000000-0000-4000-8000-000000000002";
 const dev = {
@@ -67,6 +71,8 @@ function fixture(overrides = {}) {
   const state = {
     allowed: true,
     isDeveloper: true,
+    permissions: [...allProjectPermissions],
+    canApproveTasks: true,
     canAssign: false,
     saves: 0,
     protectedTasks: [],
@@ -97,6 +103,10 @@ function fixture(overrides = {}) {
           if (table === projectTasks)
             return fields?.id ? state.protectedTasks : [task];
           if (table === taskAssignees) return [{ userId: dev.id, taskId: id }];
+          if (table === teamMemberships)
+            return [
+              { permissionRole: "member", canApproveMerge: state.allowed },
+            ];
           if (table === projectMemberships)
             return [
               {
@@ -155,6 +165,7 @@ function fixture(overrides = {}) {
   const requests = {
     access: async () => ({
       isDeveloper: state.isDeveloper,
+      permissions: state.permissions ?? [...allProjectPermissions],
       canAssign: state.canAssign,
     }),
   };
@@ -612,4 +623,14 @@ test("result records reject projects without access and unfinished tasks", async
     403,
   );
   assert.equal(f.resultEntries.length, 0);
+});
+
+test("a designated merge reviewer may merge without assignee progress rights", async () => {
+  const f = fixture();
+  await usingGithub(f, async () => {
+    await act(f, dev, "request");
+    f.state.permissions = ["tasks.read", "approvals.merge"];
+    await act(f, reviewer, "approve", "Reviewed");
+    assert.equal((await act(f, reviewer, "merge")).status, "done");
+  });
 });

@@ -1,3 +1,4 @@
+import { resolveProjectPermissions } from "./project-roles.service.js";
 import { and, eq } from "drizzle-orm";
 import { fail } from "../auth/security.js";
 import { users } from "../db/schema/auth.js";
@@ -46,7 +47,13 @@ export async function requireMergeReviewer(
     reviewer.role === "client" ||
     reviewer.accountType !== "team" ||
     reviewer.status !== "active" ||
-    !reviewer.allowed
+    !(
+      await resolveProjectPermissions(
+        tx,
+        { id: reviewer.id, accountType: reviewer.accountType },
+        pid,
+      )
+    ).canApproveMerge
   )
     fail(
       403,

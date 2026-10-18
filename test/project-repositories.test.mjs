@@ -5,26 +5,54 @@ import { WorkspaceService } from "../dist/workspace/workspace.service.js";
 
 test("repository registration accepts skipping and normalizes clone URLs", () => {
   assert.deepEqual(projectRepositories([]), []);
-  assert.deepEqual(projectRepositories([" https://github.com/Team/frontend.git/ ", "https://github.com/Team/api"]),
-    ["https://github.com/Team/frontend", "https://github.com/Team/api"]);
+  assert.deepEqual(
+    projectRepositories([
+      " https://github.com/Team/frontend.git/ ",
+      "https://github.com/Team/api",
+    ]),
+    ["https://github.com/Team/frontend", "https://github.com/Team/api"],
+  );
 });
 
 test("repository registration rejects credentials, foreign hosts, extra paths and duplicates", () => {
-  for (const value of [null, "https://github.com/a/b", [null],
+  for (const value of [
+    null,
+    "https://github.com/a/b",
+    [null],
     ["https://github.com/a/b", "https://github.com/A/B.git/"],
-    ["http://github.com/a/b"], ["https://github.com.evil.test/a/b"],
-    ["https://token@github.com/a/b"], ["https://github.com/a/b?token=secret"],
-    ["https://github.com/a/b/tree/main"], ["https://github.com/a/.."],
-    Array(21).fill("https://github.com/a/b")]) {
-    assert.throws(() => projectRepositories(value), e => e.getStatus?.() === 400);
+    ["http://github.com/a/b"],
+    ["https://github.com.evil.test/a/b"],
+    ["https://token@github.com/a/b"],
+    ["https://github.com/a/b?token=secret"],
+    ["https://github.com/a/b/tree/main"],
+    ["https://github.com/a/.."],
+    Array(21).fill("https://github.com/a/b"),
+  ]) {
+    assert.throws(
+      () => projectRepositories(value),
+      (e) => e.getStatus?.() === 400,
+    );
   }
 });
 
 test("clients cannot create projects or change repository registration", async () => {
-  const service = new WorkspaceService({ get db() { throw Error("Unexpected DB access"); } });
-  const client = { id: "00000000-0000-4000-8000-000000000001", accountType: "client" };
-  await assert.rejects(service.create(client, { name: "test" }), e => e.getStatus?.() === 403);
-  await assert.rejects(service.update(client, client.id, { repositoryUrls: [] }), e => e.getStatus?.() === 403);
+  const service = new WorkspaceService({
+    get db() {
+      throw Error("Unexpected DB access");
+    },
+  });
+  const client = {
+    id: "00000000-0000-4000-8000-000000000001",
+    accountType: "client",
+  };
+  await assert.rejects(
+    service.create(client, { name: "test" }),
+    (e) => e.getStatus?.() === 403,
+  );
+  await assert.rejects(
+    service.update(client, client.id, { repositoryUrls: [] }),
+    (e) => e.getStatus?.() === 403,
+  );
 });
 
 test("project update persists normalized repositories only after manager check", async () => {
@@ -33,15 +61,38 @@ test("project update persists normalized repositories only after manager check",
   let role = "owner";
   let count = 0;
   const tx = {
-    select: () => ({ from: () => ({ where: () => {
-      const rows = [[{ id, teamId: id }], [], [{ permissionRole: role }], [{ userId: id }]][count++];
-      return { for: async () => rows, then: (resolve) => Promise.resolve(rows).then(resolve) };
-    } }) }),
-    update: () => ({ set: value => { patch = value; return { where: () => ({ returning: async () => [{ id, ...value }] }) }; } }),
+    select: () => {
+      const q = {
+        innerJoin: () => q,
+        where: () => q,
+        for: () => q,
+        then: (resolve) => {
+          const rows = [
+            [{ id, teamId: id }],
+            [],
+            [{ permissionRole: role }],
+            [{ userId: id }],
+            [{ role: "contributor", teamId: id, rolesConfigured: false }],
+            [{ permissionRole: role }],
+            [],
+          ][count++];
+          return Promise.resolve(rows).then(resolve);
+        },
+      };
+      return { from: () => q };
+    },
+    update: () => ({
+      set: (value) => {
+        patch = value;
+        return { where: () => ({ returning: async () => [{ id, ...value }] }) };
+      },
+    }),
   };
-  const service = new WorkspaceService({ db: { transaction: fn => fn(tx) } });
+  const service = new WorkspaceService({ db: { transaction: (fn) => fn(tx) } });
   const actor = { id, accountType: "team" };
-  const result = await service.update(actor, id, { repositoryUrls: ["https://github.com/a/b.git"] });
+  const result = await service.update(actor, id, {
+    repositoryUrls: ["https://github.com/a/b.git"],
+  });
   assert.deepEqual(result.repositoryUrls, ["https://github.com/a/b"]);
   count = 0;
   await service.update(actor, id, { name: "Rename" });
@@ -52,6 +103,9 @@ test("project update persists normalized repositories only after manager check",
   count = 0;
   role = "member";
   patch = undefined;
-  await assert.rejects(service.update(actor, id, { repositoryUrls: [] }), e => e.getStatus?.() === 403);
+  await assert.rejects(
+    service.update(actor, id, { repositoryUrls: [] }),
+    (e) => e.getStatus?.() === 403,
+  );
   assert.equal(patch, undefined);
 });

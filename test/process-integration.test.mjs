@@ -1,3 +1,4 @@
+import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ProjectWorkService } from "../dist/workspace/project-work.service.js";
@@ -84,7 +85,12 @@ test("final meeting completion is idempotent and preserves decisions and linked 
   };
   const service = new ProjectWorkService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ isDeveloper: true }) },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [...allProjectPermissions],
+      }),
+    },
   );
   service.event = async () => {
     events++;

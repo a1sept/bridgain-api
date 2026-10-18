@@ -1,3 +1,4 @@
+import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
@@ -196,7 +197,13 @@ test("final meeting cannot be edited or finalized twice", async () => {
   };
   const work = new ProjectWorkService(
     { db: { transaction: (fn) => fn({ select: () => query }) } },
-    { access: async () => ({ isDeveloper: true }) },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [...allProjectPermissions],
+        canApproveTasks: true,
+      }),
+    },
   );
   await assert.rejects(
     work.saveMeeting(
@@ -211,7 +218,13 @@ test("final meeting cannot be edited or finalized twice", async () => {
 test("meetings cannot finalize without approval and reject duplicate requests", async () => {
   const work = new ProjectWorkService(
     { db: { transaction: (fn) => fn({}) } },
-    { access: async () => ({ isDeveloper: true }) },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [...allProjectPermissions],
+        canApproveTasks: true,
+      }),
+    },
   );
   const user = { id: "developer", accountType: "team" };
   await assert.rejects(
@@ -299,7 +312,12 @@ const schema = await import("../dist/db/schema/project-work.js");
 test("saving a final meeting cannot create tasks even for administrators", async () => {
   const fixture = databaseFixture([], new Map());
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ isDeveloper: true, canAssign: true }),
+    access: async () => ({
+      isDeveloper: true,
+      permissions: [...allProjectPermissions],
+      canApproveTasks: true,
+      canAssign: true,
+    }),
   });
   await assert.rejects(
     service.saveMeeting({ id: "admin", accountType: "team" }, "project", {
@@ -313,7 +331,11 @@ test("saving a final meeting cannot create tasks even for administrators", async
 test("direct task creation is rejected before any writes", async () => {
   const fixture = databaseFixture([[]], new Map());
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ isDeveloper: true }),
+    access: async () => ({
+      isDeveloper: true,
+      permissions: [...allProjectPermissions],
+      canApproveTasks: true,
+    }),
   });
   await assert.rejects(
     service.saveTask({ id: "developer", accountType: "team" }, "project", {
@@ -342,7 +364,11 @@ test("first edit preserves legacy document contents and stores the new version w
     new Map([[schema.projectDocuments, updated]]),
   );
   const service = new ProjectWorkService(fixture.database, {
-    access: async () => ({ isDeveloper: true }),
+    access: async () => ({
+      isDeveloper: true,
+      permissions: [...allProjectPermissions],
+      canApproveTasks: true,
+    }),
   });
   await service.saveDocument(
     { id: "editor", accountType: "team" },

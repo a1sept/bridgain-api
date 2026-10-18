@@ -110,6 +110,7 @@ export const projectMemberships = pgTable(
       .references(() => users.id),
     accessRole: text("access_role").notNull(),
     canApproveTasks: boolean("can_approve_tasks").notNull().default(false),
+    rolesConfigured: boolean("roles_configured").notNull().default(false),
     createdAt: created(),
   },
   (t) => [

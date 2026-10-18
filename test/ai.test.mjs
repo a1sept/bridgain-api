@@ -66,7 +66,18 @@ test("other developers cannot read or write an unowned session even in the same 
   };
   const ai = new AiService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ isDeveloper: true }) },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [
+          "requests.read",
+          "meetings.read",
+          "documents.read",
+          "tasks.read",
+          "requests.create",
+        ],
+      }),
+    },
     {},
   );
   const id = "abcdef01-1234-4321-abcd-123456789012";
@@ -100,7 +111,16 @@ test("AI request lookup always uses the session project scope", async () => {
   const ai = new AiService(
     { db: { transaction: (fn) => fn({ select: () => q }) } },
     {
-      access: async () => ({ isDeveloper: true }),
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [
+          "requests.read",
+          "meetings.read",
+          "documents.read",
+          "tasks.read",
+          "requests.create",
+        ],
+      }),
       detail: async (...args) => {
         call = args;
         return { request: {} };
@@ -159,7 +179,18 @@ function approvalFixture(draft, work, extraRows = []) {
   };
   const service = new AiService(
     { db: { transaction: (fn) => fn(tx) } },
-    { access: async () => ({ isDeveloper: true }) },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: [
+          "requests.read",
+          "meetings.read",
+          "documents.read",
+          "tasks.read",
+          "requests.create",
+        ],
+      }),
+    },
     work,
   );
   return { service, tx, inserted, marked: () => marked };
@@ -284,4 +315,29 @@ test("AI result drafts preserve optimistic concurrency when applying to ongoing 
     (e) => e.getStatus() === 409,
   );
   assert.equal(f.marked(), false);
+});
+
+test("revoking area reads denies AI history before any session data query", async () => {
+  const tx = new Proxy(
+    {},
+    {
+      get() {
+        throw Error("history must not be queried");
+      },
+    },
+  );
+  const service = new AiService(
+    { db: { transaction: (fn) => fn(tx) } },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: ["requests.read", "tasks.read"],
+      }),
+    },
+    {},
+  );
+  await assert.rejects(
+    service.list({ id: "dev", accountType: "team" }, "project"),
+    (e) => e.getStatus() === 403,
+  );
 });

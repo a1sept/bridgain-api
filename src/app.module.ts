@@ -1,3 +1,5 @@
+import { ProjectRolesController } from "./workspace/project-roles.controller.js";
+import { ProjectRolesService } from "./workspace/project-roles.service.js";
 import { ApprovalService } from "./workspace/approval.service.js";
 import { ApprovalController } from "./workspace/approval.controller.js";
 import { GithubConnectionController } from "./workspace/github-connection.controller.js";
@@ -19,6 +21,7 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    ProjectRolesController,
     ApprovalController,
     GithubConnectionController,
     AiController,
@@ -30,6 +33,7 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    ProjectRolesService,
     ApprovalService,
     GithubConnectionService,
     AiService,

@@ -1,3 +1,4 @@
+import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 const base = process.env.PROJECT_WORK_DIST || "../dist";
@@ -89,4 +90,130 @@ test("membership failure propagates without reading project work", async () => {
     service.listTasks({ id: "stranger", accountType: "team" }, "project"),
     /Not a project member/,
   );
+});
+
+test("project roles deny each ungranted area before accessing work data", async () => {
+  const tx = new Proxy(
+    {},
+    {
+      get() {
+        throw Error("Unexpected data access");
+      },
+    },
+  );
+  const service = new ProjectWorkService(
+    { db: { transaction: (fn) => fn(tx) } },
+    { access: async () => ({ isDeveloper: true, permissions: [] }) },
+  );
+  const user = { id: "restricted", accountType: "team" };
+  for (const [method, args] of [
+    ["listTasks", []],
+    ["saveTask", [{}]],
+    ["listMeetings", []],
+    ["saveMeeting", [{}]],
+    ["listDocuments", []],
+    ["saveDocument", [{}]],
+    ["listActivity", []],
+  ])
+    await assert.rejects(
+      service[method](user, "project", ...args),
+      (e) => e.getStatus() === 403,
+    );
+});
+
+test("task-only readers cannot retrieve linked request or document metadata through tasks", async () => {
+  const {
+    projectTasks,
+    taskAssignees,
+    taskResultEntries,
+    documentVersions,
+    taskRequests,
+  } = await import("../dist/db/schema/project-work.js");
+  const touched = [];
+  const tx = {
+    select: () => ({
+      from: (table) => {
+        touched.push(table);
+        if (table === documentVersions || table === taskRequests)
+          throw Error("Restricted metadata queried");
+        const q = {
+          innerJoin: () => q,
+          where: () => q,
+          orderBy: () => q,
+          then: (resolve) =>
+            Promise.resolve(
+              table === projectTasks
+                ? [{ id: "task", title: "Approved work" }]
+                : [],
+            ).then(resolve),
+        };
+        return q;
+      },
+    }),
+  };
+  const service = new ProjectWorkService(
+    { db: { transaction: (fn) => fn(tx) } },
+    {
+      access: async () => ({ isDeveloper: true, permissions: ["tasks.read"] }),
+    },
+  );
+  const result = await service.listTasks(
+    { id: "reader", accountType: "team" },
+    "project",
+  );
+  assert.deepEqual(result.tasks[0].documentVersions, []);
+  assert.deepEqual(result.tasks[0].requests, []);
+  assert.deepEqual(result.tasks[0].requestIds, []);
+  assert.ok(touched.includes(taskAssignees));
+  assert.ok(touched.includes(taskResultEntries));
+});
+
+test("activity-only readers cannot retrieve comments or content from denied areas", async () => {
+  const { projectActivity } = await import("../dist/db/schema/project-work.js");
+  const tx = {
+    select: () => ({
+      from: (table) => {
+        assert.equal(
+          table,
+          projectActivity,
+          "request comments must not be queried",
+        );
+        const q = {
+          innerJoin: () => q,
+          where: () => q,
+          orderBy: () => q,
+          limit: () => q,
+          then: (resolve) =>
+            Promise.resolve(
+              [
+                "task_updated",
+                "document_updated",
+                "meeting_updated",
+                "request_transferred",
+                "future_kind",
+              ].map((kind) => ({
+                kind,
+                body: "private content",
+                createdAt: new Date(),
+              })),
+            ).then(resolve),
+        };
+        return q;
+      },
+    }),
+  };
+  const service = new ProjectWorkService(
+    { db: { transaction: (fn) => fn(tx) } },
+    {
+      access: async () => ({
+        isDeveloper: true,
+        permissions: ["activity.read"],
+      }),
+    },
+  );
+  const result = await service.listActivity(
+    { id: "reader", accountType: "team" },
+    "project",
+  );
+  assert.deepEqual(result.events, []);
 });
