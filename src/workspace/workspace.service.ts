@@ -1,5 +1,12 @@
-import { projectRoles } from "../db/schema/project-roles.js";
-import { resolveProjectPermissions } from "./project-roles.service.js";
+import { defaultProjectRoles } from "./default-project-roles.js";
+import {
+  projectMemberRoles,
+  projectRoles,
+} from "../db/schema/project-roles.js";
+import {
+  allProjectPermissions,
+  resolveProjectPermissions,
+} from "./project-roles.service.js";
 import { repositoryRelations } from "./submodules.js";
 import { randomUUID } from "node:crypto";
 import { projectRepositories } from "./project-repositories.js";
@@ -372,7 +379,27 @@ export class WorkspaceService {
         .returning();
       await tx
         .insert(pm)
-        .values({ projectId: p.id, userId: u.id, accessRole: "manager" });
+        .values({
+          projectId: p.id,
+          userId: u.id,
+          accessRole: "manager",
+          rolesConfigured: true,
+        });
+      const createdRoles = await tx
+        .insert(projectRoles)
+        .values(
+          defaultProjectRoles(allProjectPermissions).map((role) => ({
+            projectId: p.id,
+            ...role,
+          })),
+        )
+        .returning();
+      const administrator = createdRoles.find(
+        (role) => role.name === "프로젝트 관리자",
+      )!;
+      await tx
+        .insert(projectMemberRoles)
+        .values({ projectId: p.id, userId: u.id, roleId: administrator.id });
       if (inviteeIds.length)
         await tx.insert(invitations).values(
           inviteeIds.map((inviteeId) => ({

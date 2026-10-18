@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -49,6 +50,18 @@ export class ProjectRolesController {
       pid,
       rid,
       body,
+    );
+  }
+  @Delete("roles/:roleId") async remove(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string,
+    @Param("roleId") rid: string,
+  ) {
+    return this.roles.remove(
+      await this.workspace.user(req, res, true),
+      pid,
+      rid,
     );
   }
   @Patch("member-roles/:userId") async assign(

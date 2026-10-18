@@ -278,6 +278,29 @@ export class ProjectRolesService {
       return { role };
     });
   }
+  async remove(u: User, pid: string, rid: string) {
+    uuid(rid);
+    return this.database.db.transaction(async (tx) => {
+      const access = await resolveProjectPermissions(tx, u, pid, true);
+      if (!access.canManageRoles)
+        fail(403, "FORBIDDEN", "역할·권한 관리 권한이 필요합니다.");
+      const [role] = await tx
+        .select()
+        .from(roles)
+        .where(and(eq(roles.projectId, pid), eq(roles.id, rid)));
+      if (!role) fail(404, "NOT_FOUND", "역할을 찾을 수 없습니다.");
+      const members = await tx
+        .select({ userId: assigned.userId })
+        .from(assigned)
+        .where(and(eq(assigned.projectId, pid), eq(assigned.roleId, rid)));
+      // The FK cascades this role's assignments only. Keep rolesConfigured=true
+      // so deleting someone's final role never restores legacy permissions.
+      await tx
+        .delete(roles)
+        .where(and(eq(roles.projectId, pid), eq(roles.id, rid)));
+      return { deleted: true, affectedMembers: members.length };
+    });
+  }
   async assign(
     u: User,
     pid: string,
