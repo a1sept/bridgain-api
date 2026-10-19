@@ -1,3 +1,4 @@
+import { recordRequestHandler } from "./request-handler.js";
 import { randomUUID } from "node:crypto";
 import {
   requireMergeReviewer,
@@ -1274,6 +1275,9 @@ export class ProjectWorkService {
             ),
           );
       for (const plan of plans) {
+        if (!previous.some((item) => item.requestId === plan.requestId)) {
+          await recordRequestHandler(tx, plan.requestId, u, "meeting");
+        }
         await tx
           .insert(requestWorkflowLinks)
           .values({ requestId: plan.requestId, meetingId: row.id })

@@ -103,6 +103,17 @@ export class RequestsService {
       .select({ name: users.displayName })
       .from(users)
       .where(eq(users.id, request.createdBy));
+    const [handler] = await tx
+      .select({
+        userId: users.id,
+        displayName: users.displayName,
+        handledAt: e.createdAt,
+      })
+      .from(e)
+      .innerJoin(users, eq(users.id, e.actorId))
+      .where(and(eq(e.requestId, request.id), eq(e.kind, "handler_assignment")))
+      .orderBy(desc(e.createdAt), desc(e.id))
+      .limit(1);
     const assignees = await tx
       .select({ userId: a.userId, displayName: users.displayName })
       .from(a)
@@ -133,6 +144,7 @@ export class RequestsService {
     );
     return {
       ...request,
+      handler: handler ?? null,
       workflowStage,
       meetingId: link?.meetingId ?? null,
       meetingTitle: link?.meetingId

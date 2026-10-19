@@ -1,3 +1,4 @@
+import { recordRequestHandler } from "./request-handler.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, desc, inArray, sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -454,6 +455,8 @@ export class ApprovalService {
         .insert(reviewers)
         .values(approverIds.map((userId) => ({ approvalId: a.id, userId })));
       for (const plan of plans) {
+        if (source === "urgent")
+          await recordRequestHandler(tx, plan.requestId, u, "urgent");
         await tx
           .insert(links)
           .values({ requestId: plan.requestId, meetingId, approvalId: a.id })
