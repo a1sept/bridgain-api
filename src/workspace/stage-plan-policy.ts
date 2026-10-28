@@ -1,8 +1,12 @@
+import { parseRichDocument, richDocumentText } from "./rich-document.js";
 import { fail } from "../auth/security.js";
 import type { StagePlan } from "../db/schema/project-work.js";
 import { bounded, uuid } from "./workspace.service.js";
 
-export function parseStagePlans(raw: unknown, draft = false): StagePlan[] | undefined {
+export function parseStagePlans(
+  raw: unknown,
+  draft = false,
+): StagePlan[] | undefined {
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw) || (!draft && !raw.length) || raw.length > 30)
     fail(400, "STAGE_REQUIRED", "단계를 1개 이상 30개 이하로 구성해주세요.");
@@ -25,11 +29,17 @@ export function parseStagePlans(raw: unknown, draft = false): StagePlan[] | unde
       fail(400, "INVALID_STAGE_MODE", "단계 완료 방식을 확인해주세요.");
     if (!Array.isArray(s.dependsOn) || s.dependsOn.length > 30)
       fail(400, "INVALID_DEPENDENCY", "선행 단계를 확인해주세요.");
+    const document = parseRichDocument(s.briefDocument);
     return {
       id,
       name: bounded(s.name ?? "", 100, !draft),
       title: bounded(s.title ?? "", 200, !draft),
-      brief: bounded(s.brief ?? "", 10000, !draft),
+      brief: bounded(
+        document ? richDocumentText(document) : (s.brief ?? ""),
+        10000,
+        !draft,
+      ),
+      ...(s.briefDocument !== undefined ? { briefDocument: document } : {}),
       completionMode: mode as StagePlan["completionMode"],
       assigneeIds: list(s.assigneeIds),
       reviewerIds: list(s.reviewerIds),

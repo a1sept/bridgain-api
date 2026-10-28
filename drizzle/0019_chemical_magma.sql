@@ -1,0 +1,1 @@
+ALTER TABLE "project_tasks" ADD COLUMN "description_document" jsonb;

@@ -625,6 +625,7 @@ export class ApprovalService {
                   projectId: pid,
                   title: stage.title,
                   description: stage.brief,
+                  descriptionDocument: stage.briefDocument ?? null,
                   priority: plan.priority,
                   createdBy: a.requestedBy,
                   approvalId: a.id,

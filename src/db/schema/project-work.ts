@@ -1,3 +1,4 @@
+import type { RichDocument } from "../../workspace/rich-document.js";
 import { sql } from "drizzle-orm";
 import {
   pgTable,
@@ -45,6 +46,7 @@ export const projectTasks = pgTable(
     approvedHeadSha: text("approved_head_sha").notNull().default(""),
     version: uuid("version").notNull().defaultRandom(),
     description: text("description").notNull().default(""),
+    descriptionDocument: jsonb("description_document").$type<RichDocument>(),
     status: text("status").notNull().default("todo"),
     priority: text("priority").notNull().default("normal"),
     dueDate: date("due_date"),
@@ -315,6 +317,7 @@ export type StagePlan = {
   name: string;
   title: string;
   brief: string;
+  briefDocument?: RichDocument | null;
   completionMode: "document" | "design" | "code" | "test" | "deploy";
   assigneeIds: string[];
   reviewerIds: string[];

@@ -1,3 +1,4 @@
+import {parseRichDocument, richDocumentText} from "./rich-document.js";
 import { recordRequestHandler } from "./request-handler.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -545,6 +546,7 @@ export class ProjectWorkService {
         for (const key of [
           "title",
           "description",
+          "descriptionDocument",
           "priority",
           "dueDate",
           "assigneeIds",
@@ -565,9 +567,10 @@ export class ProjectWorkService {
             );
         }
       }
+      const descriptionDocument = b.descriptionDocument === undefined ? old?.descriptionDocument ?? null : parseRichDocument(b.descriptionDocument);
       const title = bounded(b?.title ?? old?.title, 160),
         description = bounded(
-          b?.description ?? old?.description ?? "",
+          descriptionDocument ? richDocumentText(descriptionDocument) : b?.description ?? old?.description ?? "",
           10000,
           false,
         ),
@@ -831,6 +834,7 @@ export class ProjectWorkService {
           : {}),
         title,
         description,
+        descriptionDocument,
         status: nextStatus,
         priority,
         dueDate: due,

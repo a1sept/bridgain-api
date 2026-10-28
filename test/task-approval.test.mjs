@@ -217,3 +217,64 @@ test("configured roles cannot submit assigned approval plans without task assign
     (e) => e.getStatus() === 403,
   );
 });
+
+test("final approval transfers rich task brief without dropping formatting", async () => {
+  const document = {
+    version: 1,
+    blocks: [
+      {
+        id: "p",
+        type: "paragraph",
+        props: {},
+        content: [{ type: "text", text: "서식 내용", styles: { bold: true } }],
+        children: [],
+      },
+    ],
+  };
+  const staged = {
+    ...approval,
+    plans: [
+      {
+        requestId: id,
+        planning: "",
+        priority: "high",
+        assigneeIds: [id],
+        stages: [
+          {
+            id: "stage",
+            name: "기획",
+            title: "업무",
+            brief: "서식 내용",
+            briefDocument: document,
+            completionMode: "document",
+            assigneeIds: [id],
+            reviewerIds: [id],
+            dependsOn: [],
+          },
+        ],
+      },
+    ],
+  };
+  const f = fixture([
+    [staged],
+    eligible,
+    [{ userId: id, status: "pending" }],
+    [{ userId: id, status: "approved" }],
+    eligible,
+    [{ userId: id }],
+    [{ id, role: "contributor" }],
+    [{ id, title: "요청" }],
+    [],
+    [{ ...staged, status: "approved" }],
+    [{ userId: id, status: "approved" }],
+    [{ name: "P" }],
+    [{ displayName: "D" }],
+    [{ id, title: "요청" }],
+    eligible,
+  ]);
+  await f.service.act(user, id, id, { action: "approve" });
+  const task = f.writes.find((w) => w.table === schema.projectTasks).value;
+  assert.equal(task.description, "서식 내용");
+  assert.deepEqual(task.descriptionDocument, document);
+  assert.equal(task.priority, "high");
+});
