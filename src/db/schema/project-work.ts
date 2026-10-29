@@ -130,9 +130,12 @@ export const projectMeetings = pgTable(
     ...common(),
     scheduledAt: timestamp("scheduled_at", { withTimezone: true }).notNull(),
     durationMinutes: integer("duration_minutes").notNull(),
+    finalApproverIds: jsonb("final_approver_ids").$type<string[]>().notNull().default([]),
     location: text("location").notNull().default(""),
     notes: text("notes").notNull().default(""),
     status: text("status").notNull().default("scheduled"),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    endedAt: timestamp("ended_at", { withTimezone: true }),
     requestId: uuid("request_id").references(() => projectRequests.id),
     decisionStatus: text("decision_status").notNull().default("draft"),
   },
@@ -148,7 +151,7 @@ export const projectMeetings = pgTable(
     ),
     check(
       "meeting_status_check",
-      sql`${t.status} IN ('scheduled','completed')`,
+      sql`${t.status} IN ('scheduled','in_progress','completed')`,
     ),
   ],
 );
@@ -197,6 +200,7 @@ export const meetingRequests = pgTable(
     requestId: uuid("request_id")
       .notNull()
       .references(() => projectRequests.id),
+    discussionStatus: text("discussion_status").notNull().default("unreviewed"),
     planning: text("planning").notNull().default(""),
     uiNotes: text("ui_notes").notNull().default(""),
     apiNotes: text("api_notes").notNull().default(""),

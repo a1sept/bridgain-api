@@ -996,6 +996,20 @@ export class ProjectWorkService {
       };
     });
   }
+  async meetingAction(u:User,pid:string,id:string,b:Record<string,unknown>) {
+    const action=choice(b?.action,["start","complete"]);
+    return this.database.db.transaction(async tx=>{
+      await this.access(tx,u,pid,true,"meetings.update");
+      const [meeting]=await tx.select().from(meetings).where(and(eq(meetings.id,uuid(id)),eq(meetings.projectId,pid))).for("update");
+      if(!meeting)fail(404,"NOT_FOUND","회의를 찾을 수 없습니다.");
+      const next=action==="start"?"in_progress":"completed";
+      if(meeting.status===next)return {meeting};
+      if((action==="start"&&meeting.status!=="scheduled")||(action==="complete"&&meeting.status!=="in_progress"))fail(409,"INVALID_TRANSITION","회의 진행 상태를 확인해주세요.");
+      const [row]=await tx.update(meetings).set({status:next,...(action==="start"?{startedAt:sql`clock_timestamp()`}:{endedAt:sql`clock_timestamp()`}),updatedAt:sql`clock_timestamp()`}).where(eq(meetings.id,meeting.id)).returning();
+      await this.event(tx,u,pid,id,action==="start"?"meeting_started":"meeting_completed",meeting.title);
+      return {meeting:row};
+    });
+  }
   async saveMeeting(
     u: User,
     pid: string,
@@ -1022,34 +1036,10 @@ export class ProjectWorkService {
           .for("update");
         if (!old) fail(404, "NOT_FOUND", "회의를 찾을 수 없습니다.");
       }
-      if (old?.decisionStatus === "final") {
-        if (
-          b.status !== "completed" ||
-          Object.keys(b).some((key) => key !== "status")
-        )
-          fail(
-            409,
-            "MEETING_FINAL",
-            "최종안 내용은 수정할 수 없습니다. 회의 완료 처리만 가능합니다.",
-          );
-        if (old.status !== "completed") {
-          await tx
-            .update(meetings)
-            .set({ status: "completed", updatedAt: sql`clock_timestamp()` })
-            .where(eq(meetings.id, old.id));
-          await this.event(tx, u, pid, old.id, "meeting_completed", old.title);
-        }
-        return {
-          meeting: {
-            ...old,
-            status: "completed",
-            requests: await tx
-              .select()
-              .from(meetingRequests)
-              .where(eq(meetingRequests.meetingId, old.id)),
-          },
-        };
-      }
+      if (b.status !== undefined && b.status !== (old?.status ?? "scheduled"))
+        fail(409, "MEETING_ACTION_REQUIRED", "회의 시작하기 또는 완전 마무리 버튼을 사용해주세요.");
+      if (old?.decisionStatus === "final")
+        fail(409,"MEETING_FINAL","최종안 내용은 수정할 수 없습니다.");
       const decisionStatus = choice(
         b.decisionStatus ?? old?.decisionStatus ?? "draft",
         ["draft", "final"],
@@ -1097,6 +1087,7 @@ export class ProjectWorkService {
           fail(400, "VALIDATION_ERROR", "요청 메모를 확인해주세요.");
         return {
           requestId: uuid(item.requestId).toLowerCase(),
+          discussionStatus: choice(item.discussionStatus ?? previous.find(p => p.requestId === item.requestId)?.discussionStatus ?? "unreviewed", ["unreviewed", "discussed", "deferred"]),
           planning: bounded(item.planning ?? "", 10000, false),
           uiNotes: bounded(item.uiNotes ?? "", 10000, false),
           apiNotes: bounded(item.apiNotes ?? "", 10000, false),
@@ -1220,6 +1211,8 @@ export class ProjectWorkService {
         duration > 480
       )
         fail(400, "VALIDATION_ERROR", "회의 시간은 15~480분입니다.");
+      const finalApproverIds = ids(b.finalApproverIds ?? old?.finalApproverIds ?? []);
+      await this.links(tx, pid, finalApproverIds, []);
       const requestId = plans[0]?.requestId ?? null;
       const values = {
         title: bounded(b?.title ?? old?.title, 160),
@@ -1227,13 +1220,11 @@ export class ProjectWorkService {
           b?.scheduledAt ?? old?.scheduledAt.toISOString(),
         ),
         durationMinutes: duration as number,
+        finalApproverIds,
         decisionStatus,
         location: bounded(b?.location ?? old?.location ?? "", 1000, false),
         notes: bounded(b?.notes ?? old?.notes ?? "", 20000, false),
-        status: choice(b?.status ?? old?.status ?? "scheduled", [
-          "scheduled",
-          "completed",
-        ]),
+        status: old?.status ?? "scheduled",
         requestId,
       };
       const [row] = old

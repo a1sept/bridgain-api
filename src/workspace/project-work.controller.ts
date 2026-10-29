@@ -132,6 +132,9 @@ export class ProjectWorkController {
       id,
     );
   }
+  @Post("meetings/:id/actions") async meetingAction(
+    @Req() req:Request,@Res({passthrough:true}) res:Response,@Param("projectId") pid:string,@Param("id") id:string,@Body() b:Record<string,unknown>,
+  ){return this.work.meetingAction(await this.workspace.user(req,res,true),pid,id,b);}
   @Get("documents") async documents(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,

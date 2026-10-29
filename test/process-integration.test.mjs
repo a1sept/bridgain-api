@@ -49,7 +49,7 @@ test("final meeting completion is idempotent and preserves decisions and linked 
   let meeting = {
     id,
     decisionStatus: "final",
-    status: "scheduled",
+    status: "in_progress",
     title: "Final meeting",
     notes: "Agreed scope",
   };
@@ -76,9 +76,7 @@ test("final meeting completion is idempotent and preserves decisions and linked 
           return [meeting];
         }),
     }),
-    insert: () => {
-      throw Error("Must not duplicate assigned tasks");
-    },
+    insert: () => { throw Error("Must not duplicate assigned tasks"); },
     delete: () => {
       throw Error("Must not rebuild final request plans");
     },
@@ -95,15 +93,10 @@ test("final meeting completion is idempotent and preserves decisions and linked 
   service.event = async () => {
     events++;
   };
-  const result = await service.saveMeeting(
-    user,
-    id,
-    { status: "completed" },
-    id,
-  );
+  const result = await service.meetingAction(user,id,id,{action:"complete"});
   assert.equal(result.meeting.status, "completed");
-  assert.deepEqual(result.meeting.requests, plans);
-  await service.saveMeeting(user, id, { status: "completed" }, id);
+  assert.deepEqual(plans, [{ requestId: id, taskId: id, planning: "Agreed plan" }]);
+  await service.meetingAction(user,id,id,{action:"complete"});
   assert.equal(writes, 1);
   assert.equal(events, 1);
   for (const body of [
