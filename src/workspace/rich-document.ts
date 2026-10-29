@@ -20,10 +20,10 @@ const colors = new Set([
   "purple",
   "pink",
 ]);
-export function parseRichDocument(raw: unknown): RichDocument | null {
+export function parseRichDocument(raw: unknown, maxLength = 10000): RichDocument | null {
   if (raw === undefined || raw === null) return null;
   const bad = (): never =>
-    fail(400, "INVALID_DOCUMENT", "업무 문서 형식 또는 크기를 확인해주세요.");
+    fail(400, "INVALID_DOCUMENT", "문서 형식 또는 크기를 확인해주세요.");
   if (typeof raw !== "object" || Array.isArray(raw)) return bad();
   const doc = raw as Record<string, unknown>;
   if (
@@ -46,7 +46,7 @@ export function parseRichDocument(raw: unknown): RichDocument | null {
       if (x.type === "text") {
         if (typeof x.text !== "string") return bad();
         textLength += x.text.length;
-        if (textLength > 10000) return bad();
+        if (textLength > maxLength) return bad();
         const styles = record(x.styles ?? {});
         for (const [key, value] of Object.entries(styles)) {
           if (["bold", "italic", "underline", "strike", "code"].includes(key)) {
@@ -126,7 +126,7 @@ export function parseRichDocument(raw: unknown): RichDocument | null {
     });
   };
   const result: RichDocument = { version: 1, blocks: blocks(doc.blocks) };
-  if (richDocumentText(result).length > 10000) return bad();
+  if (richDocumentText(result).length > maxLength) return bad();
   return result;
 }
 export function richDocumentText(doc: RichDocument): string {

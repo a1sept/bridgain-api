@@ -1,3 +1,4 @@
+import { meetingDocument } from "./meeting-document.js";
 import { recordActivity, recordTaskActivity } from "./activity-record.js";
 import {parseRichDocument, richDocumentText} from "./rich-document.js";
 import { recordRequestHandler } from "./request-handler.js";
@@ -1090,10 +1091,13 @@ export class ProjectWorkService {
       const plans = (source as Record<string, unknown>[]).map((item) => {
         if (!item || typeof item !== "object")
           fail(400, "VALIDATION_ERROR", "요청 메모를 확인해주세요.");
+        const previousPlan = previous.find(p => p.requestId === item.requestId);
+        const memo = meetingDocument(item.planningDocument, item.planning, previousPlan?.planning ?? "", previousPlan?.planningDocument ?? null);
         return {
           requestId: uuid(item.requestId).toLowerCase(),
           discussionStatus: choice(item.discussionStatus ?? previous.find(p => p.requestId === item.requestId)?.discussionStatus ?? "unreviewed", ["unreviewed", "discussed", "deferred"]),
-          planning: bounded(item.planning ?? "", 10000, false),
+          planning: bounded(memo.text, 10000, false),
+          planningDocument: memo.document,
           uiNotes: bounded(item.uiNotes ?? "", 10000, false),
           apiNotes: bounded(item.apiNotes ?? "", 10000, false),
           dbNotes: bounded(item.dbNotes ?? "", 10000, false),
@@ -1219,6 +1223,7 @@ export class ProjectWorkService {
         fail(400, "VALIDATION_ERROR", "회의 시간은 15~480분입니다.");
       const finalApproverIds = ids(b.finalApproverIds ?? old?.finalApproverIds ?? []);
       await this.links(tx, pid, finalApproverIds, []);
+      const memo = meetingDocument(b.notesDocument, b.notes, old?.notes ?? "", old?.notesDocument ?? null, 20000);
       const requestId = plans[0]?.requestId ?? null;
       const values = {
         title: bounded(b?.title ?? old?.title, 160),
@@ -1229,7 +1234,8 @@ export class ProjectWorkService {
         finalApproverIds,
         decisionStatus,
         location: bounded(b?.location ?? old?.location ?? "", 1000, false),
-        notes: bounded(b?.notes ?? old?.notes ?? "", 20000, false),
+        notes: bounded(memo.text, 20000, false),
+        notesDocument: memo.document,
         status: old?.status ?? "scheduled",
         requestId,
       };
