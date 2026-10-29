@@ -148,6 +148,13 @@
       "when": 1793227602220,
       "tag": "0023_meeting_tool",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1793227602221,
+      "tag": "0024_activity_history",
+      "breakpoints": true
     }
   ]
 }

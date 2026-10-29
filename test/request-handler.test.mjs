@@ -62,6 +62,7 @@ function fixture({ existing = false, linked = false, invalid = false } = {}) {
         return {
           ...chain([]),
           returning: () => chain([{ id: mid, ...value }]),
+          onConflictDoNothing: () => chain([]),
           onConflictDoUpdate: () => chain([]),
         };
       },

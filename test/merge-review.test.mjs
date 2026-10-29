@@ -91,7 +91,7 @@ function fixture(overrides = {}) {
       then: (resolve, reject) =>
         Promise.resolve().then(fn).then(resolve, reject),
     };
-    for (const name of ["innerJoin", "where", "for", "orderBy", "limit"])
+    for (const name of ["onConflictDoNothing", "innerJoin", "where", "for", "orderBy", "limit"])
       value[name] = () => value;
     return value;
   };

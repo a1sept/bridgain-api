@@ -52,7 +52,7 @@ function fixture(overrides = {}) {
   ];
   const chain = (fn) => {
     const q = { then: (yes, no) => Promise.resolve().then(fn).then(yes, no) };
-    for (const name of ["where", "for", "orderBy", "innerJoin", "limit"])
+    for (const name of ["onConflictDoNothing", "where", "for", "orderBy", "innerJoin", "limit"])
       q[name] = () => q;
     q.returning = () => q;
     return q;

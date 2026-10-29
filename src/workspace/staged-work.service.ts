@@ -1,3 +1,4 @@
+import { recordTaskActivity } from "./activity-record.js";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { and, eq, inArray, sql, desc } from "drizzle-orm";
@@ -62,8 +63,9 @@ export class StagedWorkService {
     action: string,
     note = "",
     headSha = "",
+    system = false,
   ) {
-    await tx.insert(events).values({
+    const [recorded]=await tx.insert(events).values({
       taskId: task.id,
       actorId,
       action,
@@ -71,7 +73,10 @@ export class StagedWorkService {
       headSha,
       revision: task.workRevision,
       createdAt: sql`clock_timestamp()`,
-    });
+    }).returning();
+    const kind=({completed:task.completionMode==="test"?"qa_completed":"task_completed",approved:"task_approved",changes_requested:"task_changes_requested",invalidated:"task_invalidated",deploy_started:"deploy_ready",released:"deploy_completed",deploy_failed:"deploy_failed"} as Record<string,string>)[action] ?? "task_invalidated";
+    await recordTaskActivity(tx,task.id,actorId,kind,note,`work:${recorded.id}`,system);
+
   }
   private async descendants(tx: Tx, task: Task) {
     const found: Task[] = [];
@@ -405,6 +410,7 @@ export class StagedWorkService {
           })
           .where(eq(tasks.id, id));
         await this.record(tx, task, u.id, "completed", note, head);
+        if(all) await recordTaskActivity(tx,task.id,u.id,"task_review_requested","담당자 전원이 작업을 완료하여 검토를 요청했습니다.");
         return { status };
       }
       if (task.status !== "review_pending")
@@ -610,6 +616,7 @@ export class StagedWorkService {
             updatedAt: sql`clock_timestamp()`,
           })
           .where(eq(attempts.id, attempt.id));
+        await recordTaskActivity(tx,task.id,u.id,"deploy_failed","병합 충돌",`attempt:${attempt.id}:failed`);
         return {
           status: "in_progress",
           error: "병합 충돌로 재작업이 필요합니다.",
@@ -637,6 +644,7 @@ export class StagedWorkService {
               updatedAt: sql`clock_timestamp()`,
             })
             .where(eq(attempts.id, attempt.id));
+          await recordTaskActivity(tx,task.id,u.id,"deploy_failed","병합 거절",`attempt:${attempt.id}:failed`);
           return {
             status: "in_progress",
             error: "병합할 수 없어 재작업이 필요합니다.",
@@ -669,6 +677,7 @@ export class StagedWorkService {
             updatedAt: sql`clock_timestamp()`,
           })
           .where(eq(attempts.id, attempt.id));
+        await recordTaskActivity(tx,task.id,u.id,"deploy_failed","배포 결과 확인 실패",`attempt:${attempt.id}:failed`);
         return {
           status: "deploy_pending",
           error:
@@ -809,6 +818,8 @@ export class StagedWorkService {
           current.createdBy,
           "released",
           event.url,
+          "",
+          true,
         );
         await this.unlock(tx, task.id);
       });

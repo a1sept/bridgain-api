@@ -1,3 +1,4 @@
+import { recordActivity, recordTaskActivity } from "./activity-record.js";
 import {parseRichDocument, richDocumentText} from "./rich-document.js";
 import { recordRequestHandler } from "./request-handler.js";
 import { randomUUID } from "node:crypto";
@@ -534,6 +535,7 @@ export class ProjectWorkService {
           .where(eq(tasks.id, old.id))
           .returning();
         await this.event(tx, u, pid, old.id, "task_updated", old.title);
+        if (old.status !== row.status && row.status === "in_progress") await recordTaskActivity(tx,row.id,u.id,row.completionMode === "test" ? "qa_started" : "task_started");
         return { task: await this.taskOutput(tx, row, taskAccess.permissions) };
       }
       if (old && !gitEvent) {
@@ -870,6 +872,7 @@ export class ProjectWorkService {
         old ? "task_updated" : "task_created",
         title,
       );
+      if (old && old.status !== row.status) await recordTaskActivity(tx,row.id,gitEvent ? null : u.id,({in_progress:"task_started",done:"deploy_ready",released:"deploy_completed"} as Record<string,string>)[row.status] ?? "task_status_changed");
       await this.syncRequests(tx, u, pid, [
         ...new Set([...requestIds, ...(current?.requestIds ?? [])]),
       ]);
@@ -1006,6 +1009,8 @@ export class ProjectWorkService {
       if(meeting.status===next)return {meeting};
       if((action==="start"&&meeting.status!=="scheduled")||(action==="complete"&&meeting.status!=="in_progress"))fail(409,"INVALID_TRANSITION","회의 진행 상태를 확인해주세요.");
       const [row]=await tx.update(meetings).set({status:next,...(action==="start"?{startedAt:sql`clock_timestamp()`}:{endedAt:sql`clock_timestamp()`}),updatedAt:sql`clock_timestamp()`}).where(eq(meetings.id,meeting.id)).returning();
+      const linked=await tx.select().from(meetingRequests).where(eq(meetingRequests.meetingId,id));
+      await recordActivity(tx,{projectId:pid,kind:action==="start"?"meeting_started":"meeting_completed",category:"meeting",title:meeting.title,actorId:u.id,meetingId:meeting.id,requestIds:linked.map(r=>r.requestId),sourceKey:`meeting:${meeting.id}:${action}`});
       await this.event(tx,u,pid,id,action==="start"?"meeting_started":"meeting_completed",meeting.title);
       return {meeting:row};
     });
@@ -1165,6 +1170,7 @@ export class ProjectWorkService {
             body: "연결 회의가 변경되었습니다.",
             actorId: u.id,
           });
+          await recordActivity(tx,{projectId:pid,kind:"request_transferred",category:"meeting",title:sourceMeeting.title,actorId:u.id,meetingId:sourceMeeting.id,requestIds:[plan.requestId],body:"다른 회의로 요청이 이동되었습니다."});
           // Keep old notes in history, but remove the current association.
           await tx.insert(activity).values({
             projectId: pid,
@@ -1294,6 +1300,10 @@ export class ProjectWorkService {
           .insert(meetingRequests)
           .values({ ...plan, meetingId: row.id, taskId });
       }
+      const added=plans.filter(p=>!previous.some(x=>x.requestId===p.requestId)).map(p=>p.requestId);
+      const removed=previous.filter(p=>!plans.some(x=>x.requestId===p.requestId)).map(p=>p.requestId);
+      if(!old || added.length) await recordActivity(tx,{projectId:pid,kind:old?"request_linked":"meeting_scheduled",category:"meeting",title:row.title,actorId:u.id,meetingId:row.id,requestIds:old?added:plans.map(p=>p.requestId),sourceKey:old?undefined:`meeting:${row.id}:created`});
+      if(removed.length) await recordActivity(tx,{projectId:pid,kind:"request_unlinked",category:"meeting",title:row.title,actorId:u.id,meetingId:row.id,requestIds:removed});
       return {
         meeting: {
           ...row,
@@ -1603,6 +1613,7 @@ export class ProjectWorkService {
               createdAt: requestEvents.createdAt,
               actorName: users.displayName,
               title: projectRequests.title,
+              origin: projectRequests.origin,
               status: requestEvents.status,
             })
             .from(requestEvents)

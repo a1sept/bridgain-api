@@ -1,3 +1,5 @@
+import { ActivityController } from "./workspace/activity.controller.js";
+import { ActivityService } from "./workspace/activity.service.js";
 import { ChannelController } from "./workspace/channel.controller.js";
 import { ChannelService } from "./workspace/channel.service.js";
 import { ProjectRolesController } from "./workspace/project-roles.controller.js";
@@ -27,6 +29,7 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    ActivityController,
     ChannelController,
     StagedWorkController,
     StageSettingsController,
@@ -42,6 +45,7 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    ActivityService,
     ChannelService,
     StagedWorkService,
     StageSettingsService,

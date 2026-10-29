@@ -1,3 +1,4 @@
+import { recordActivity } from "./activity-record.js";
 import { resolveProjectPermissions } from "./project-roles.service.js";
 import { customerWorkflowStage } from "./workflow-progress.js";
 import { Injectable } from "@nestjs/common";
@@ -241,6 +242,7 @@ export class RequestsService {
         createdAt: sql`clock_timestamp()`,
         body: "요청이 접수되었습니다.",
       });
+      await recordActivity(tx,{projectId:pid,kind:"request_created",category:"request",title:request.title,actorId:u.id,requestIds:[request.id],sourceKey:`request:${request.id}:created`});
       return { request: await this.output(tx, request) };
     });
   }

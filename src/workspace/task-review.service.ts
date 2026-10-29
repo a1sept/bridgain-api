@@ -1,3 +1,4 @@
+import { recordTaskActivity } from "./activity-record.js";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { and, eq, desc, sql } from "drizzle-orm";
@@ -276,6 +277,7 @@ export class TaskReviewService {
           baseSha: pr.base.sha,
           note: message,
         });
+        await recordTaskActivity(tx,id,u.id,({requested:"task_review_requested",approved:"task_approved",changes_requested:"task_changes_requested",stale:"task_invalidated",merged:"deploy_ready"} as Record<string,string>)[event] ?? "task_invalidated",message);
       };
       if (action === "request") {
         await tx

@@ -1,3 +1,4 @@
+import { activityEvents } from "../dist/db/schema/activity.js";
 import { allProjectPermissions } from "../dist/workspace/project-roles.service.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -14,7 +15,7 @@ const chain = (fn) => {
   const q = {
     then: (resolve, reject) => Promise.resolve().then(fn).then(resolve, reject),
   };
-  for (const name of ["where", "for", "returning", "innerJoin", "orderBy"])
+  for (const name of ["onConflictDoNothing", "where", "for", "returning", "innerJoin", "orderBy"])
     q[name] = () => q;
   return q;
 };
@@ -76,7 +77,10 @@ test("final meeting completion is idempotent and preserves decisions and linked 
           return [meeting];
         }),
     }),
-    insert: () => { throw Error("Must not duplicate assigned tasks"); },
+    insert: (table) => {
+      assert.equal(table, activityEvents);
+      return { values:()=>chain(()=>[]) };
+    },
     delete: () => {
       throw Error("Must not rebuild final request plans");
     },

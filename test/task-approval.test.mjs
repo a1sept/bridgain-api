@@ -42,6 +42,7 @@ function fixture(rows) {
         writes.push({ table, value });
         return {
           returning: () => query([{ id, ...value }]),
+          onConflictDoNothing: () => query([]),
           onConflictDoUpdate: () => query([]),
         };
       },
@@ -265,6 +266,11 @@ test("final approval transfers rich task brief without dropping formatting", asy
     [{ id, role: "contributor" }],
     [{ id, title: "요청" }],
     [],
+    [{ id, projectId:id, title:"업무" }],
+    [{ requestId:id }],
+    [{ id, title:"요청", origin:"development" }],
+    [{ id, name:"담당자" }],
+    [{ name:"승인자" }],
     [{ ...staged, status: "approved" }],
     [{ userId: id, status: "approved" }],
     [{ name: "P" }],

@@ -1,3 +1,4 @@
+import { recordTaskActivity } from "./activity-record.js";
 import { recordRequestHandler } from "./request-handler.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, desc, inArray, sql } from "drizzle-orm";
@@ -646,6 +647,7 @@ export class ApprovalService {
                   userId,
                 })),
               );
+              await recordTaskActivity(tx, task.id, u.id, "task_assigned", "", `task:${task.id}:assigned`);
               await tx.insert(taskWorkReviewers).values(
                 stage.reviewerIds.map((userId) => ({
                   taskId: task.id,
@@ -704,6 +706,7 @@ export class ApprovalService {
               .values(
                 plan.assigneeIds.map((userId) => ({ taskId: task.id, userId })),
               );
+            await recordTaskActivity(tx, task.id, u.id, "task_assigned", "", `task:${task.id}:assigned`);
             await tx
               .update(links)
               .set({ taskId: task.id })
