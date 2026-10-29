@@ -84,7 +84,7 @@ export const projectTasks = pgTable(
     index("task_project_idx").on(t.projectId, t.createdAt),
     check(
       "task_status_check",
-      sql`${t.status} IN ('blocked','todo','in_progress','review_pending','done','deploy_pending','deploying','released')`,
+      sql`${t.status} IN ('todo','in_progress','review_pending','done','deploy_pending','deploying','released')`,
     ),
     check(
       "task_completion_mode_check",
@@ -319,6 +319,7 @@ export const taskApprovals = pgTable(
   ],
 );
 export type StagePlan = {
+  dueDate?: string | null;
   id: string;
   name: string;
   title: string;

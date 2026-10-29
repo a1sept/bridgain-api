@@ -131,7 +131,7 @@ export class StagedWorkService {
       await tx
         .update(tasks)
         .set({
-          status: "blocked",
+          status: child.status === "todo" ? "todo" : "in_progress",
           approvedHeadSha: "",
           reviewHeadSha: "",
           workRevision: child.workRevision + 1,
@@ -152,7 +152,7 @@ export class StagedWorkService {
         child,
         actorId,
         "predecessor_changed",
-        "선행 작업이 변경되어 재작업 및 재승인이 필요합니다.",
+        "선행 업무가 변경되었습니다. 변경 내용을 확인하고 작업을 계속해주세요. 기존 완료·승인은 초기화되었습니다.",
       );
     }
   }
@@ -328,7 +328,7 @@ export class StagedWorkService {
           "NEW_REQUEST_REQUIRED",
           "완료된 업무의 변경은 새 개발 요청으로 등록해주세요.",
         );
-      await this.predecessors(tx, task);
+      if (action === "approve") await this.predecessors(tx, task);
       const assigned = await tx
         .select()
         .from(taskAssignees)
@@ -383,8 +383,6 @@ export class StagedWorkService {
           fail(409, "INVALID_TRANSITION", "진행 중 업무만 완료할 수 있습니다.");
         if (!assigned.some((a) => a.userId === u.id))
           fail(403, "ASSIGNEE_REQUIRED", "담당자만 완료할 수 있습니다.");
-        if (!task.resultSummary.trim() || !task.verification.trim())
-          fail(400, "RESULT_REQUIRED", "작업 결과와 검증 내용을 저장해주세요.");
         if (!votes.length)
           fail(409, "REVIEWER_REQUIRED", "작업 승인자를 지정해주세요.");
         for (const v of votes) {
@@ -450,30 +448,8 @@ export class StagedWorkService {
         })
         .where(eq(tasks.id, id));
       await this.record(tx, task, u.id, "approved", note, head);
-      if (all) await this.unlock(tx, id);
       return { status };
     });
-  }
-  private async unlock(tx: Tx, id: string) {
-    const children = await tx
-      .select({ id: taskDependencies.taskId })
-      .from(taskDependencies)
-      .where(eq(taskDependencies.predecessorId, id));
-    for (const child of children) {
-      const [task] = await tx
-        .select()
-        .from(tasks)
-        .where(eq(tasks.id, child.id));
-      if (task?.status === "blocked") {
-        try {
-          await this.predecessors(tx, task);
-          await tx
-            .update(tasks)
-            .set({ status: "todo", version: randomUUID() })
-            .where(eq(tasks.id, child.id));
-        } catch {}
-      }
-    }
   }
   async deployments(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
@@ -707,7 +683,6 @@ export class StagedWorkService {
         })
         .where(eq(tasks.id, id));
       await this.record(tx, task, u.id, "released", url);
-      await this.unlock(tx, id);
       return { status: "released" };
     });
   }
@@ -821,7 +796,6 @@ export class StagedWorkService {
           "",
           true,
         );
-        await this.unlock(tx, task.id);
       });
       updated++;
     }

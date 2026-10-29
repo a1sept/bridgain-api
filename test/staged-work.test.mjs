@@ -42,6 +42,7 @@ function fixture(overrides = {}) {
     { taskId: id, userId: u.id, status: "pending" },
     { taskId: id, userId: other, status: "pending" },
   ];
+  const taskWrites = [];
   const events = [],
     attempts = [];
   let permissions = [
@@ -77,7 +78,7 @@ function fixture(overrides = {}) {
     update: (table) => ({
       set: (values) =>
         chain(() => {
-          if (table === tasks) task = { ...task, ...values };
+          if (table === tasks) { taskWrites.push(values); task = { ...task, ...values }; }
           if (table === taskAssignees)
             assigned = assigned.map((a) =>
               values.completedAt === null || a.userId === u.id
@@ -116,6 +117,7 @@ function fixture(overrides = {}) {
   );
   return {
     service,
+    taskWrites,
     tx,
     setDescendants: (value) => (descendants = value),
     get task() {
@@ -441,4 +443,56 @@ test("standalone deployment checkpoint can complete with deployment URL and all 
     ).status,
     "released",
   );
+});
+
+
+test("unfinished predecessor permits completion and refresh but blocks final approval", async () => {
+  const f = fixture({ status: "todo" });
+  f.service.ancestorTasks = async () => [{ id: other, status: "in_progress", completionMode: "document" }];
+  assert.equal((await f.service.act(u, pid, id, { action: "refresh" })).status, "todo");
+  assert.equal((await f.service.act(u, pid, id, { action: "complete", expectedRevision: 1 })).status, "review_pending");
+  await assert.rejects(
+    f.service.act(u, pid, id, { action: "approve", expectedRevision: 1 }),
+    e => e.response.code === "PREDECESSOR_REQUIRED",
+  );
+  assert.equal(f.reviewers[0].status, "pending");
+});
+
+test("unfinished predecessor does not prevent a rework request", async () => {
+  const f = fixture({ status: "review_pending" });
+  f.service.ancestorTasks = async () => [{ id: other, status: "in_progress" }];
+  assert.equal((await f.service.act(u, pid, id, {
+    action: "changes_requested", expectedRevision: 1, note: "수정 필요",
+  })).status, "in_progress");
+});
+
+test("predecessor rework leaves descendants actionable and invalidates previous approvals", async () => {
+  for (const status of ["todo", "in_progress", "review_pending", "done", "deploy_pending"]) {
+    const f = fixture({ status: "done" });
+    f.service.descendants = async () => [{ id: other, status, workRevision: 3 }];
+    await f.service.act(u, pid, id, {
+      action: "changes_requested", expectedRevision: 1, note: "선행 수정",
+    });
+    const child = f.taskWrites.at(-1);
+    assert.equal(child.status, status === "todo" ? "todo" : "in_progress");
+    assert.equal(child.workRevision, 4);
+    assert.equal(child.approvedHeadSha, "");
+    assert.equal(f.events.at(-1).action, "predecessor_changed");
+    assert.equal(f.events.at(-1).taskId, other);
+  }
+});
+
+test("unfinished predecessor still prevents deployment", async () => {
+  const f = deployFixture();
+  f.service.ancestorTasks = async () => [{ id: other, status: "in_progress" }];
+  const result = await f.service.deploy(u, pid, { taskIds: [id] });
+  assert.equal(result.results[0].status, "failed");
+  assert.equal(result.results[0].error, "선행 업무 승인이 필요합니다.");
+  assert.equal(f.task.status, "deploy_pending");
+});
+
+test("completion no longer requires separate result and verification fields", async () => {
+  const f = fixture({ resultSummary: "", verification: "" });
+  assert.equal((await f.service.act(u, pid, id, { action: "complete", expectedRevision: 1 })).status, "review_pending");
+  assert.equal(f.reviewers.every(v => v.status === "pending"), true);
 });

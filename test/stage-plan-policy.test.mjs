@@ -20,3 +20,13 @@ test('meeting drafts can retain incomplete stages, approval submission remains s
  assert.throws(()=>parseStagePlans(draft));
  assert.deepEqual(parseStagePlans([],true),[]);
 });
+
+test('stage deadlines accept valid dates, clearing and legacy omission but reject invalid dates', () => {
+  for (const value of ['2028-02-29', '2026-10-30', null, '']) {
+    assert.equal(parseStagePlans([{...stage('a'), dueDate:value}])[0].dueDate, value || null);
+  }
+  assert.equal(parseStagePlans([stage('a')])[0].dueDate, undefined);
+  for (const value of ['2026-02-29', '2026-04-31', 'tomorrow', '2026-10-30T00:00:00Z', 123]) {
+    assert.throws(() => parseStagePlans([{...stage('a'), dueDate:value}], true));
+  }
+});

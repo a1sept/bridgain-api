@@ -626,6 +626,7 @@ export class ApprovalService {
                   projectId: pid,
                   title: stage.title,
                   description: stage.brief,
+                  dueDate: stage.dueDate ?? null,
                   descriptionDocument: stage.briefDocument ?? null,
                   priority: plan.priority,
                   createdBy: a.requestedBy,
@@ -634,7 +635,7 @@ export class ApprovalService {
                   stageName: stage.name,
                   stageOrder: order,
                   completionMode: stage.completionMode,
-                  status: stage.dependsOn.length ? "blocked" : "todo",
+                  status: "todo",
                 })
                 .returning();
               stageIds.set(stage.id, task.id);

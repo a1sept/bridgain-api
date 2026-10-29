@@ -5,6 +5,7 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
   Param,
   Body,
   Req,
@@ -132,6 +133,10 @@ export class ProjectWorkController {
       id,
     );
   }
+  @Delete("meetings/:id") async deleteMeeting(
+    @Req() req: Request, @Res({ passthrough: true }) res: Response,
+    @Param("projectId") pid: string, @Param("id") id: string,
+  ) { return this.work.deleteMeeting(await this.workspace.user(req, res, true), pid, id); }
   @Post("meetings/:id/actions") async meetingAction(
     @Req() req:Request,@Res({passthrough:true}) res:Response,@Param("projectId") pid:string,@Param("id") id:string,@Body() b:Record<string,unknown>,
   ){return this.work.meetingAction(await this.workspace.user(req,res,true),pid,id,b);}

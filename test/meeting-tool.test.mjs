@@ -107,6 +107,13 @@ test(
       saved = (await work.listMeetings(owner,pid)).meetings.find(m=>m.id===meeting.id);
       assert.deepEqual(saved.finalApproverIds,[worker.id]);
       assert.equal(saved.requests[0].discussionStatus,"deferred");
+      const deadlineStage = {id:"deadline",name:"기획",title:"기한 업무",brief:"할 일",completionMode:"document",assigneeIds:[worker.id],reviewerIds:[owner.id],dependsOn:[],dueDate:"2026-11-15"};
+      await work.saveMeeting(owner,pid,{requests:[{requestId:request.id,stages:[deadlineStage]}]},meeting.id);
+      saved = (await work.listMeetings(owner,pid)).meetings.find(m=>m.id===meeting.id);
+      assert.equal(saved.requests[0].stages[0].dueDate,"2026-11-15");
+      await work.saveMeeting(owner,pid,{notes:"일정 유지"},meeting.id);
+      saved = (await work.listMeetings(owner,pid)).meetings.find(m=>m.id===meeting.id);
+      assert.equal(saved.requests[0].stages[0].dueDate,"2026-11-15");
       const memo = (text) => ({version:1,blocks:[{id:"memo",type:"bulletListItem",props:{},content:[{type:"text",text,styles:{bold:true}}],children:[]}]});
       const notesDocument = memo("회의 결론"), planningDocument = memo("요청 논의");
       await work.saveMeeting(owner,pid,{notesDocument,requests:[{requestId:request.id,planningDocument}]},meeting.id);
@@ -132,6 +139,49 @@ test(
       await assert.rejects(work.saveMeeting(owner,pid,{requests:[{requestId:request.id,discussionStatus:"invalid"}]},meeting.id),e=>e.getStatus()===400);
       const legacy=(await work.saveMeeting(owner,pid,{title:"이전 클라이언트",scheduledAt:"2026-10-30T02:00:00Z"})).meeting;
       assert.deepEqual(legacy.finalApproverIds,[]);
+      await assert.rejects(work.meetingAction(owner,pid,legacy.id,{action:"complete"}),e=>e.getStatus()===409);
+      const started=(await work.meetingAction(owner,pid,legacy.id,{action:"start"})).meeting;
+      assert.equal(started.status,"in_progress");
+      assert(started.startedAt);
+      assert.equal((await work.listMeetings(owner,pid)).meetings.find(m=>m.id===legacy.id).status,"in_progress");
+      assert.equal((await work.meetingAction(owner,pid,legacy.id,{action:"start"})).meeting.status,"in_progress");
+      const completed=(await work.meetingAction(owner,pid,legacy.id,{action:"complete"})).meeting;
+      assert.equal(completed.status,"completed");
+      assert(completed.endedAt);
+      assert.equal(completed.decisionStatus,"draft");
+      await assert.rejects(work.meetingAction(owner,pid,legacy.id,{action:"start"}),e=>e.getStatus()===409);
+      await assert.rejects(work.meetingAction(outsider,pid,legacy.id,{action:"reopen"}));
+      await pg.query("UPDATE project_meetings SET decision_status='final' WHERE id=$1",[legacy.id]);
+      const reopened=(await work.meetingAction(owner,pid,legacy.id,{action:"reopen"})).meeting;
+      assert.equal(reopened.status,"in_progress");
+      assert.equal(reopened.endedAt,null);
+      assert.equal(reopened.decisionStatus,"final");
+      assert.deepEqual(reopened.startedAt,started.startedAt);
+      await work.meetingAction(owner,pid,legacy.id,{action:"reopen"});
+      await work.meetingAction(owner,pid,legacy.id,{action:"complete"});
+      const events=await pg.query("SELECT kind FROM activity_events WHERE meeting_id=$1 AND kind IN ('meeting_reopened','meeting_completed')",[legacy.id]);
+      assert.equal(events.rows.filter(e=>e.kind==='meeting_reopened').length,1);
+      assert.equal(events.rows.filter(e=>e.kind==='meeting_completed').length,2);
+
+
+      await assert.rejects(work.deleteMeeting(outsider,pid,meeting.id));
+      await assert.rejects(work.deleteMeeting(owner,pid2,meeting.id));
+      await assert.rejects(work.deleteMeeting(owner,pid,legacy.id),e=>e.getStatus()===409);
+      const approvalId=randomUUID();
+      await pg.query("INSERT INTO task_approvals(id,project_id,source,meeting_id,title,requested_by,plans,status) VALUES($1,$2,'meeting',$3,'삭제 승인 테스트',$4,'[]','pending')",[approvalId,pid,meeting.id,owner.id]);
+      await assert.rejects(work.deleteMeeting(owner,pid,meeting.id),e=>e.getStatus()===409);
+      assert((await work.listMeetings(owner,pid)).meetings.some(m=>m.id===meeting.id));
+      await pg.query("UPDATE task_approvals SET status='cancelled' WHERE id=$1",[approvalId]);
+      await work.deleteMeeting(owner,pid,meeting.id);
+      assert(!(await work.listMeetings(owner,pid)).meetings.some(m=>m.id===meeting.id));
+      assert.equal((await pg.query("SELECT id FROM project_requests WHERE id=$1",[request.id])).rows.length,1);
+      assert.equal((await pg.query("SELECT meeting_id FROM request_workflow_links WHERE request_id=$1",[request.id])).rows[0].meeting_id,null);
+      assert.equal((await pg.query("SELECT * FROM meeting_requests WHERE meeting_id=$1",[meeting.id])).rows.length,0);
+      assert.equal((await pg.query("SELECT meeting_id,status FROM task_approvals WHERE id=$1",[approvalId])).rows[0].status,'cancelled');
+      assert.equal((await pg.query("SELECT meeting_id FROM task_approvals WHERE id=$1",[approvalId])).rows[0].meeting_id,null);
+      await assert.rejects(work.deleteMeeting(owner,pid,meeting.id),e=>e.getStatus()===404);
+      const relinked=(await work.saveMeeting(owner,pid,{title:"다시 연결",scheduledAt:"2026-10-30T02:00:00Z",requests:[{requestId:request.id}]})).meeting;
+      assert.equal(relinked.requests[0].requestId,request.id);
     } finally {await pg.close();}
   },
 );

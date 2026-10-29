@@ -219,7 +219,7 @@ test("configured roles cannot submit assigned approval plans without task assign
   );
 });
 
-test("final approval transfers rich task brief without dropping formatting", async () => {
+test("final approval transfers task deadline and rich task brief without dropping formatting", async () => {
   const document = {
     version: 1,
     blocks: [
@@ -247,6 +247,7 @@ test("final approval transfers rich task brief without dropping formatting", asy
             title: "업무",
             brief: "서식 내용",
             briefDocument: document,
+            dueDate: "2026-11-15",
             completionMode: "document",
             assigneeIds: [id],
             reviewerIds: [id],
@@ -282,5 +283,6 @@ test("final approval transfers rich task brief without dropping formatting", asy
   const task = f.writes.find((w) => w.table === schema.projectTasks).value;
   assert.equal(task.description, "서식 내용");
   assert.deepEqual(task.descriptionDocument, document);
+  assert.equal(task.dueDate, "2026-11-15");
   assert.equal(task.priority, "high");
 });

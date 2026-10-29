@@ -1,3 +1,5 @@
+import { dueDate } from "./due-date.js";
+export { dueDate } from "./due-date.js";
 import { meetingDocument } from "./meeting-document.js";
 import { recordActivity, recordTaskActivity } from "./activity-record.js";
 import {parseRichDocument, richDocumentText} from "./rich-document.js";
@@ -54,17 +56,6 @@ export function ids(value: unknown): string[] {
   if (!Array.isArray(value) || value.length > 50)
     fail(400, "VALIDATION_ERROR", "연결 항목은 최대 50개입니다.");
   return [...new Set((value as unknown[]).map((v) => uuid(v).toLowerCase()))];
-}
-export function dueDate(value: unknown): string | null {
-  if (value === null || value === "") return null;
-  if (
-    typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
-    !Number.isFinite(Date.parse(value)) ||
-    new Date(value).toISOString().slice(0, 10) !== value
-  )
-    fail(400, "VALIDATION_ERROR", "올바른 날짜를 입력해주세요.");
-  return value as string;
 }
 export function documentUrl(value: unknown): string | null {
   if (value === null || value === "") return null;
@@ -1000,19 +991,44 @@ export class ProjectWorkService {
       };
     });
   }
+  async deleteMeeting(u: User, pid: string, id: string) {
+    return this.database.db.transaction(async tx => {
+      await this.access(tx, u, pid, true, "meetings.update");
+      const meetingId = uuid(id);
+      const [meeting] = await tx.select().from(meetings).where(and(eq(meetings.id, meetingId), eq(meetings.projectId, pid))).for("update");
+      if (!meeting) fail(404, "NOT_FOUND", "회의를 찾을 수 없습니다.");
+      const approvals = await tx.select().from(taskApprovals).where(eq(taskApprovals.meetingId, meetingId));
+      if (approvals.some(a => a.status === "pending")) fail(409, "APPROVAL_PENDING", "승인함에서 업무 생성 승인 요청을 취소한 후 삭제해주세요.");
+      const linked = await tx.select().from(meetingRequests).where(eq(meetingRequests.meetingId, meetingId));
+      const workflow = await tx.select().from(requestWorkflowLinks).where(eq(requestWorkflowLinks.meetingId, meetingId));
+      if (meeting.decisionStatus === "final" || approvals.some(a => a.status === "approved") || linked.some(p => p.taskId) || workflow.some(p => p.taskId))
+        fail(409, "MEETING_HAS_TASKS", "업무가 생성된 회의는 삭제할 수 없습니다.");
+      // Keep original requests and historical approval snapshots; release only this meeting's links.
+      await tx.update(requestWorkflowLinks).set({ meetingId: null }).where(eq(requestWorkflowLinks.meetingId, meetingId));
+      await tx.update(taskApprovals).set({ meetingId: null }).where(eq(taskApprovals.meetingId, meetingId));
+      await tx.delete(meetingRequests).where(eq(meetingRequests.meetingId, meetingId));
+      await recordActivity(tx, { projectId: pid, kind: "meeting_deleted", category: "meeting", title: meeting.title,
+        body: "회의가 삭제되었습니다. 연결된 요청은 유지됩니다.", actorId: u.id, requestIds: linked.map(p => p.requestId) });
+      await this.event(tx, u, pid, meetingId, "meeting_deleted", meeting.title);
+      await tx.delete(meetings).where(eq(meetings.id, meetingId));
+      return { deleted: true };
+    });
+  }
   async meetingAction(u:User,pid:string,id:string,b:Record<string,unknown>) {
-    const action=choice(b?.action,["start","complete"]);
+    const action=choice(b?.action,["start","complete","reopen"]);
     return this.database.db.transaction(async tx=>{
       await this.access(tx,u,pid,true,"meetings.update");
       const [meeting]=await tx.select().from(meetings).where(and(eq(meetings.id,uuid(id)),eq(meetings.projectId,pid))).for("update");
       if(!meeting)fail(404,"NOT_FOUND","회의를 찾을 수 없습니다.");
-      const next=action==="start"?"in_progress":"completed";
+      const next=action==="complete"?"completed":"in_progress";
       if(meeting.status===next)return {meeting};
-      if((action==="start"&&meeting.status!=="scheduled")||(action==="complete"&&meeting.status!=="in_progress"))fail(409,"INVALID_TRANSITION","회의 진행 상태를 확인해주세요.");
-      const [row]=await tx.update(meetings).set({status:next,...(action==="start"?{startedAt:sql`clock_timestamp()`}:{endedAt:sql`clock_timestamp()`}),updatedAt:sql`clock_timestamp()`}).where(eq(meetings.id,meeting.id)).returning();
+      if((action==="start"&&meeting.status!=="scheduled")||(action==="complete"&&meeting.status!=="in_progress")||(action==="reopen"&&meeting.status!=="completed"))fail(409,"INVALID_TRANSITION","회의 진행 상태를 확인해주세요.");
+      const [row]=await tx.update(meetings).set({status:next,...(action==="start"?{startedAt:sql`clock_timestamp()`}:action==="reopen"?{endedAt:null}:{endedAt:sql`clock_timestamp()`}),updatedAt:sql`clock_timestamp()`}).where(eq(meetings.id,meeting.id)).returning();
       const linked=await tx.select().from(meetingRequests).where(eq(meetingRequests.meetingId,id));
-      await recordActivity(tx,{projectId:pid,kind:action==="start"?"meeting_started":"meeting_completed",category:"meeting",title:meeting.title,actorId:u.id,meetingId:meeting.id,requestIds:linked.map(r=>r.requestId),sourceKey:`meeting:${meeting.id}:${action}`});
-      await this.event(tx,u,pid,id,action==="start"?"meeting_started":"meeting_completed",meeting.title);
+      const kind=action==="start"?"meeting_started":action==="reopen"?"meeting_reopened":"meeting_completed";
+      // The locked state transition is idempotent; each completion/reopen cycle gets its own event.
+      await recordActivity(tx,{projectId:pid,kind,category:"meeting",title:meeting.title,actorId:u.id,meetingId:meeting.id,requestIds:linked.map(r=>r.requestId)});
+      await this.event(tx,u,pid,id,kind,meeting.title);
       return {meeting:row};
     });
   }

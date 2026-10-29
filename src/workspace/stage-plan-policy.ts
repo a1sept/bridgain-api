@@ -1,3 +1,4 @@
+import { dueDate } from "./due-date.js";
 import { parseRichDocument, richDocumentText } from "./rich-document.js";
 import { fail } from "../auth/security.js";
 import type { StagePlan } from "../db/schema/project-work.js";
@@ -40,6 +41,7 @@ export function parseStagePlans(
         !draft,
       ),
       ...(s.briefDocument !== undefined ? { briefDocument: document } : {}),
+      ...(s.dueDate !== undefined ? { dueDate: dueDate(s.dueDate) } : {}),
       completionMode: mode as StagePlan["completionMode"],
       assigneeIds: list(s.assigneeIds),
       reviewerIds: list(s.reviewerIds),
