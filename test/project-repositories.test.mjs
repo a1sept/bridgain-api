@@ -58,9 +58,14 @@ test("clients cannot create projects or change repository registration", async (
 test("project update persists normalized repositories only after manager check", async () => {
   const id = "00000000-0000-4000-8000-000000000001";
   let patch;
+  const registrationQueries = [];
   let role = "owner";
   let count = 0;
   const tx = {
+    execute: async (query) => {
+      registrationQueries.push(query);
+      return { rows: [] };
+    },
     select: () => {
       const q = {
         innerJoin: () => q,
@@ -75,6 +80,7 @@ test("project update persists normalized repositories only after manager check",
             [{ role: "contributor", teamId: id, rolesConfigured: false }],
             [{ permissionRole: role }],
             [],
+            [{ id, teamId: id, repositoryUrls: [], repositoryRelations: [] }],
           ][count++];
           return Promise.resolve(rows).then(resolve);
         },
@@ -92,8 +98,16 @@ test("project update persists normalized repositories only after manager check",
   const actor = { id, accountType: "team" };
   const result = await service.update(actor, id, {
     repositoryUrls: ["https://github.com/a/b.git"],
+    registeredBy: "spoofed-user",
+    managerUserId: "spoofed-user",
   });
   assert.deepEqual(result.repositoryUrls, ["https://github.com/a/b"]);
+  const { PgDialect } = await import("drizzle-orm/pg-core");
+  assert.deepEqual(new PgDialect().sqlToQuery(registrationQueries[0]).params, [
+    id,
+    "https://github.com/a/b",
+    id,
+  ]);
   count = 0;
   await service.update(actor, id, { name: "Rename" });
   assert.equal(Object.hasOwn(patch, "repositoryUrls"), false);

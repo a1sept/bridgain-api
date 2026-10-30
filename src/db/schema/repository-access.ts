@@ -53,3 +53,20 @@ export const repositoryAccessRequests = pgTable(
     ),
   ],
 );
+
+export const projectRepositoryRegistrations = pgTable(
+  "project_repository_registrations",
+  {
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id),
+    repositoryUrl: text("repository_url").notNull(),
+    registeredBy: uuid("registered_by")
+      .notNull()
+      .references(() => users.id),
+    registeredAt: timestamp("registered_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.projectId, t.repositoryUrl] })],
+);

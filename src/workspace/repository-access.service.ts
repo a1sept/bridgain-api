@@ -1,10 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
-import {
-  RequestsService,
-  requireProjectPermission,
-} from "./requests.service.js";
+import { RequestsService } from "./requests.service.js";
 import { fail } from "../auth/security.js";
 import { uuid, bounded } from "./workspace.service.js";
 import { projectRepositories } from "./project-repositories.js";
@@ -45,17 +42,60 @@ export class RepositoryAccessService {
         "프로젝트에 등록된 저장소만 요청할 수 있습니다.",
       );
   }
-  private async member(tx: Tx, pid: string, id: string) {
+  private async candidates(tx: Tx, pid: string) {
     const result = await tx.execute(
-      sql`SELECT u.id,u.display_name FROM project_memberships pm JOIN projects p ON p.id=pm.project_id JOIN team_memberships tm ON tm.team_id=p.team_id AND tm.user_id=pm.user_id JOIN users u ON u.id=pm.user_id WHERE pm.project_id=${pid} AND pm.user_id=${id} AND pm.access_role<>'client' AND u.account_type='team' AND u.status='active'`,
+      sql`SELECT u.id,u.display_name FROM project_memberships pm JOIN projects p ON p.id=pm.project_id JOIN team_memberships tm ON tm.team_id=p.team_id AND tm.user_id=pm.user_id JOIN users u ON u.id=pm.user_id WHERE pm.project_id=${pid} AND pm.access_role<>'client' AND u.account_type='team' AND u.status='active' ORDER BY u.id`,
     );
-    if (!result.rows.length)
-      fail(
-        400,
-        "INVALID_REPOSITORY_MANAGER",
-        "현재 프로젝트 개발팀 구성원을 담당자로 지정해주세요.",
-      );
-    return result.rows[0];
+    return result.rows as { id: string; display_name: string }[];
+  }
+  private async routing(
+    tx: Tx,
+    pid: string,
+    repo: string,
+    candidates?: { id: string; display_name: string }[],
+  ) {
+    const result = await tx.execute(
+      sql`SELECT p.created_by,r.registered_by,u.display_name AS registered_name FROM projects p LEFT JOIN project_repository_registrations r ON r.project_id=p.id AND r.repository_url=lower(${repo}) LEFT JOIN users u ON u.id=r.registered_by WHERE p.id=${pid}`,
+    );
+    const origin = result.rows[0];
+    const members = candidates ?? (await this.candidates(tx, pid));
+    const registrant = origin?.registered_by as string | undefined;
+    let target = members.find(
+      (m) => m.id === (registrant || origin?.created_by),
+    );
+    let source = target
+      ? registrant
+        ? "registrant"
+        : "project_creator"
+      : "unavailable";
+    if (!target)
+      for (const member of members) {
+        const access = await this.requests.access(
+          tx,
+          {
+            id: member.id,
+            displayName: member.display_name,
+            accountType: "team",
+          },
+          pid,
+        );
+        if (
+          access.isDeveloper &&
+          access.permissions.includes("project.settings")
+        ) {
+          target = member;
+          source = "project_admin";
+          break;
+        }
+      }
+    return {
+      repositoryUrl: repo,
+      registeredByUserId: registrant ?? null,
+      registeredByName: origin?.registered_name ?? null,
+      recipientUserId: target?.id ?? null,
+      recipientName: target?.display_name ?? null,
+      recipientSource: source,
+    };
   }
   private async notify(tx: Tx, u: User, pid: string, body: string) {
     await tx.execute(
@@ -65,52 +105,34 @@ export class RepositoryAccessService {
   async list(u: User, pid: string) {
     return this.database.db.transaction(async (tx) => {
       const access = await this.context(tx, u, pid);
-      const repositories = await tx.execute(
-        sql`SELECT r.url AS "repositoryUrl",CASE WHEN EXISTS (SELECT 1 FROM project_memberships pm JOIN team_memberships tm ON tm.team_id=p.team_id AND tm.user_id=pm.user_id WHERE pm.project_id=p.id AND pm.user_id=m.manager_user_id AND pm.access_role<>'client') AND u.status='active' AND u.account_type='team' THEN m.manager_user_id ELSE NULL END AS "managerUserId",u.display_name AS "managerName" FROM projects p CROSS JOIN LATERAL unnest(p.repository_urls) AS r(url) LEFT JOIN project_repository_managers m ON m.project_id=p.id AND m.repository_url=r.url LEFT JOIN users u ON u.id=m.manager_user_id WHERE p.id=${pid}`,
+      const registered = await tx.execute(
+        sql`SELECT unnest(repository_urls) AS repository_url FROM projects WHERE id=${pid}`,
       );
+      const candidates = await this.candidates(tx, pid);
+      const repositories: Awaited<ReturnType<RepositoryAccessService["routing"]>>[] = [];
+      for (const row of registered.rows)
+        repositories.push(
+          await this.routing(tx, pid, String(row.repository_url), candidates),
+        );
       const requests = await tx.execute(
-        sql`SELECT a.id,a.repository_url AS "repositoryUrl",a.requester_id AS "requesterId",u.display_name AS "requesterName",a.manager_user_id AS "managerUserId",a.status,a.note,a.created_at AS "createdAt",a.resolved_at AS "resolvedAt" FROM repository_access_requests a JOIN users u ON u.id=a.requester_id WHERE a.project_id=${pid} AND (a.status='pending' OR a.id IN (SELECT id FROM repository_access_requests WHERE project_id=${pid} AND status='resolved' ORDER BY created_at DESC,id DESC LIMIT 100)) ORDER BY (a.status='pending') DESC,a.created_at DESC,a.id DESC`,
-      );
-      const members = await tx.execute(
-        sql`SELECT u.id AS "userId",u.display_name AS "displayName" FROM project_memberships pm JOIN projects p ON p.id=pm.project_id JOIN team_memberships tm ON tm.team_id=p.team_id AND tm.user_id=pm.user_id JOIN users u ON u.id=pm.user_id WHERE pm.project_id=${pid} AND pm.access_role<>'client' AND u.account_type='team' AND u.status='active' ORDER BY u.display_name,u.id`,
+        sql`SELECT a.id,a.repository_url AS "repositoryUrl",a.requester_id AS "requesterId",u.display_name AS "requesterName",a.manager_user_id AS "recipientUserId",a.status,a.note,a.created_at AS "createdAt",a.resolved_at AS "resolvedAt" FROM repository_access_requests a JOIN users u ON u.id=a.requester_id WHERE a.project_id=${pid} AND (a.status='pending' OR a.id IN (SELECT id FROM repository_access_requests WHERE project_id=${pid} AND status='resolved' ORDER BY created_at DESC,id DESC LIMIT 100)) ORDER BY (a.status='pending') DESC,a.created_at DESC,a.id DESC`,
       );
       return {
         currentUserId: u.id,
-        members: members.rows,
-        repositories: repositories.rows.map((r) => ({
-          ...r,
-          managerName: r.managerUserId ? r.managerName : null,
-        })),
-        requests: requests.rows,
+        repositories,
+        requests: requests.rows.map((row) =>
+          row.status === "pending"
+            ? {
+                ...row,
+                recipientUserId:
+                  repositories.find(
+                    (r) => r.repositoryUrl === row.repositoryUrl,
+                  )?.recipientUserId ?? null,
+              }
+            : row,
+        ),
         canManage: access.permissions.includes("project.settings"),
       };
-    });
-  }
-  async manager(u: User, pid: string, b: Record<string, unknown>) {
-    const { repositoryUrl: repo } = repositoryAccessInput(b);
-    const managerId = b.managerUserId === null ? null : uuid(b.managerUserId);
-    return this.database.db.transaction(async (tx) => {
-      const access = await this.context(tx, u, pid);
-      requireProjectPermission(access, "project.settings");
-      await this.registered(tx, pid, repo);
-      const member = managerId ? await this.member(tx, pid, managerId) : null;
-      const previous = await tx.execute(
-        sql`SELECT manager_user_id FROM project_repository_managers WHERE project_id=${pid} AND repository_url=${repo}`,
-      );
-      await tx.execute(
-        sql`INSERT INTO project_repository_managers(project_id,repository_url,manager_user_id) VALUES(${pid},${repo},${managerId}) ON CONFLICT(project_id,repository_url) DO UPDATE SET manager_user_id=EXCLUDED.manager_user_id`,
-      );
-      await tx.execute(
-        sql`UPDATE repository_access_requests SET manager_user_id=${managerId} WHERE project_id=${pid} AND repository_url=${repo} AND status='pending'`,
-      );
-      if (managerId && previous.rows[0]?.manager_user_id !== managerId)
-        await this.notify(
-          tx,
-          u,
-          pid,
-          `저장소 담당자 지정: ${String(member!.display_name)} · ${repo}. 프로젝트 설정에서 저장소 접근 요청을 확인해주세요.`,
-        );
-      return { ok: true };
     });
   }
   async request(u: User, pid: string, b: Record<string, unknown>) {
@@ -118,17 +140,14 @@ export class RepositoryAccessService {
     return this.database.db.transaction(async (tx) => {
       await this.context(tx, u, pid);
       await this.registered(tx, pid, repo);
-      const manager = await tx.execute(
-        sql`SELECT manager_user_id FROM project_repository_managers WHERE project_id=${pid} AND repository_url=${repo}`,
-      );
-      const managerId = manager.rows[0]?.manager_user_id as string | undefined;
+      const target = await this.routing(tx, pid, repo);
+      const managerId = target.recipientUserId;
       if (!managerId)
         fail(
           409,
-          "REPOSITORY_MANAGER_REQUIRED",
-          "프로젝트 관리자가 먼저 저장소 담당자를 지정해야 합니다.",
+          "REPOSITORY_RECIPIENT_UNAVAILABLE",
+          "저장소 등록자와 요청을 받을 프로젝트 관리자가 없습니다. 프로젝트 관리자에게 구성원 권한 확인을 요청해주세요.",
         );
-      const target = await this.member(tx, pid, managerId!);
       const result = await tx.execute(
         sql`INSERT INTO repository_access_requests(project_id,repository_url,requester_id,manager_user_id,note) VALUES(${pid},${repo},${u.id},${managerId},${note}) ON CONFLICT(project_id,repository_url,requester_id) WHERE status='pending' DO NOTHING RETURNING id`,
       );
@@ -136,13 +155,16 @@ export class RepositoryAccessService {
         const existing = await tx.execute(
           sql`SELECT id FROM repository_access_requests WHERE project_id=${pid} AND repository_url=${repo} AND requester_id=${u.id} AND status='pending'`,
         );
+        await tx.execute(
+          sql`UPDATE repository_access_requests SET manager_user_id=${managerId} WHERE id=${existing.rows[0].id}`,
+        );
         return { id: existing.rows[0].id, duplicate: true };
       }
       await this.notify(
         tx,
         u,
         pid,
-        `저장소 접근 요청 · 담당자 ${String(target.display_name)}: ${u.displayName}님이 ${repo} 접근을 요청했습니다.${note ? "\n" + note : ""}\n프로젝트 설정에서 확인해주세요. GitHub 권한은 담당자가 직접 확인해야 합니다.`,
+        `저장소 접근 요청 · 수신자 ${String(target.recipientName)}: ${u.displayName}님이 ${repo} 접근을 요청했습니다.${note ? "\n" + note : ""}\n프로젝트 설정에서 확인해주세요. GitHub 권한은 수신자가 직접 확인해야 합니다.`,
       );
       return { id: result.rows[0].id, duplicate: false };
     });
@@ -157,18 +179,19 @@ export class RepositoryAccessService {
       );
       const row = result.rows[0];
       if (!row) fail(404, "NOT_FOUND", "접근 요청을 찾을 수 없습니다.");
+      const target = await this.routing(tx, pid, String(row.repository_url));
       if (
-        row.manager_user_id !== u.id &&
+        target.recipientUserId !== u.id &&
         !access.permissions.includes("project.settings")
       )
         fail(
           403,
           "FORBIDDEN",
-          "지정 담당자나 프로젝트 관리자만 처리할 수 있습니다.",
+          "저장소 등록자 또는 요청 수신자·프로젝트 관리자만 처리할 수 있습니다.",
         );
       if (row.status === "resolved") return { ok: true };
       await tx.execute(
-        sql`UPDATE repository_access_requests SET status='resolved',resolved_at=clock_timestamp(),resolved_by=${u.id} WHERE id=${id}`,
+        sql`UPDATE repository_access_requests SET status='resolved',resolved_at=clock_timestamp(),resolved_by=${u.id},manager_user_id=${target.recipientUserId} WHERE id=${id}`,
       );
       await this.notify(
         tx,

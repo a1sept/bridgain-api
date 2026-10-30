@@ -24,18 +24,6 @@ export class RepositoryAccessController {
   ) {
     return this.service.list(await this.workspace.user(req, res), pid);
   }
-  @Patch("manager") async manager(
-    @Req() req: Request,
-    @Res({ passthrough: true }) res: Response,
-    @Param("projectId") pid: string,
-    @Body() body: Record<string, unknown>,
-  ) {
-    return this.service.manager(
-      await this.workspace.user(req, res, true),
-      pid,
-      body,
-    );
-  }
   @Post("requests") async request(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,

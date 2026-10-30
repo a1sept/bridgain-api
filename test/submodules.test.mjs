@@ -59,7 +59,7 @@ test('project save writes repository URLs and relationships together and prunes 
   const { WorkspaceService } = await import('../dist/workspace/workspace.service.js');
   let patch;
   let transactions = 0;
-  const tx = { update: () => ({ set: value => { patch = value; return { where: () => ({ returning: async () => [{id: 'project', ...value}] }) }; } }) };
+  const tx = { select: () => ({from: () => ({where: () => ({for: async () => [{repositoryUrls:[parentUrl,childUrl],repositoryRelations:[edge]}]})})}), update: () => ({ set: value => { patch = value; return { where: () => ({ returning: async () => [{id: 'project', ...value}] }) }; } }) };
   const workspace = new WorkspaceService({ db: { transaction: async fn => { transactions++; return fn(tx); } } });
   workspace.manager = async () => ({ repositoryUrls: [parentUrl, childUrl], repositoryRelations: [edge] });
   const actor = { id: 'actor', accountType: 'team' };

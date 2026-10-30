@@ -1,3 +1,4 @@
+import { recordRepositoryRegistrations } from "./repository-registration.js";
 import { defaultProjectRoles } from "./default-project-roles.js";
 import {
   projectMemberRoles,
@@ -377,6 +378,7 @@ export class WorkspaceService {
           createdBy: u.id,
         })
         .returning();
+      await recordRepositoryRegistrations(tx, p.id, u.id, [], repositoryUrls);
       await tx
         .insert(pm)
         .values({
@@ -439,7 +441,9 @@ export class WorkspaceService {
     if (!Object.keys(patch).length)
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
-      const existing = await this.manager(tx, u, id, "project.settings");
+      await this.manager(tx, u, id, "project.settings");
+      const [existing] = await tx.select().from(projects).where(eq(projects.id,id)).for("update");
+      if (patch.repositoryUrls) await recordRepositoryRegistrations(tx,id,u.id,existing.repositoryUrls,patch.repositoryUrls);
       if (patch.repositoryUrls && patch.repositoryRelations === undefined) {
         const selected = new Set(
           patch.repositoryUrls.map((url) => url.toLowerCase()),
