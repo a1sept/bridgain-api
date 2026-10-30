@@ -985,7 +985,8 @@ export class ProjectWorkService {
             requests: await tx
               .select()
               .from(meetingRequests)
-              .where(eq(meetingRequests.meetingId, row.id)),
+              .where(eq(meetingRequests.meetingId, row.id))
+              .orderBy(meetingRequests.position, meetingRequests.requestId),
           })),
         ),
       };
@@ -1094,6 +1095,7 @@ export class ProjectWorkService {
             .select()
             .from(meetingRequests)
             .where(eq(meetingRequests.meetingId, old.id))
+            .orderBy(meetingRequests.position, meetingRequests.requestId)
         : [];
       const source =
         b.requests ??
@@ -1316,11 +1318,11 @@ export class ProjectWorkService {
           actorId: u.id,
         });
       }
-      for (const plan of plans) {
+      for (const [position, plan] of plans.entries()) {
         let taskId: string | null = null;
         await tx
           .insert(meetingRequests)
-          .values({ ...plan, meetingId: row.id, taskId });
+          .values({ ...plan, position, meetingId: row.id, taskId });
       }
       const added=plans.filter(p=>!previous.some(x=>x.requestId===p.requestId)).map(p=>p.requestId);
       const removed=previous.filter(p=>!plans.some(x=>x.requestId===p.requestId)).map(p=>p.requestId);
@@ -1332,7 +1334,8 @@ export class ProjectWorkService {
           requests: await tx
             .select()
             .from(meetingRequests)
-            .where(eq(meetingRequests.meetingId, row.id)),
+            .where(eq(meetingRequests.meetingId, row.id))
+              .orderBy(meetingRequests.position, meetingRequests.requestId),
         },
       };
     }, existingTx);

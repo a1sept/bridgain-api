@@ -201,6 +201,7 @@ export const meetingRequests = pgTable(
     requestId: uuid("request_id")
       .notNull()
       .references(() => projectRequests.id),
+    position: integer("position").notNull().default(0),
     discussionStatus: text("discussion_status").notNull().default("unreviewed"),
     planning: text("planning").notNull().default(""),
     planningDocument: jsonb("planning_document").$type<RichDocument>(),

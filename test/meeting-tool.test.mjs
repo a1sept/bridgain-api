@@ -164,6 +164,18 @@ test(
       assert.equal(events.rows.filter(e=>e.kind==='meeting_completed').length,2);
 
 
+      const second = await create("순서2"), third = await create("순서3");
+      const order = [third.id, request.id, second.id];
+      await work.saveMeeting(owner, pid, { requests: order.map(requestId => ({ requestId })) }, meeting.id);
+      const reordered = (await work.listMeetings(owner, pid)).meetings.find(m => m.id === meeting.id);
+      assert.deepEqual(reordered.requests.map(r => r.requestId), order);
+      assert.deepEqual(reordered.requests.map(r => r.position), [0, 1, 2]);
+      await work.saveMeeting(owner, pid, { notes: "순서 유지" }, meeting.id);
+      assert.deepEqual((await work.listMeetings(owner, pid)).meetings.find(m => m.id === meeting.id).requests.map(r => r.requestId), order);
+      const reversed = [...order].reverse();
+      const response = await work.saveMeeting(owner, pid, { requests: reversed.map(requestId => ({ requestId })) }, meeting.id);
+      assert.deepEqual(response.meeting.requests.map(r => r.requestId), reversed);
+
       await assert.rejects(work.deleteMeeting(outsider,pid,meeting.id));
       await assert.rejects(work.deleteMeeting(owner,pid2,meeting.id));
       await assert.rejects(work.deleteMeeting(owner,pid,legacy.id),e=>e.getStatus()===409);

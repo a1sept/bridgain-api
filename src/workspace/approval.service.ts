@@ -287,7 +287,8 @@ export class ApprovalService {
         raw = await tx
           .select()
           .from(meetingRequests)
-          .where(eq(meetingRequests.meetingId, meetingId));
+          .where(eq(meetingRequests.meetingId, meetingId))
+          .orderBy(meetingRequests.position, meetingRequests.requestId);
         if (b.plans !== undefined) raw = b.plans;
       }
       if (!Array.isArray(raw) || !raw.length || raw.length > 50)
@@ -442,7 +443,8 @@ export class ApprovalService {
         const rows = await tx
           .select()
           .from(meetingRequests)
-          .where(eq(meetingRequests.meetingId, meetingId));
+          .where(eq(meetingRequests.meetingId, meetingId))
+          .orderBy(meetingRequests.position, meetingRequests.requestId);
         if (rows.length !== plans.length)
           fail(409, "MEETING_CHANGED", "회의의 모든 요청을 함께 승인해주세요.");
       }
