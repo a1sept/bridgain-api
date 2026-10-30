@@ -41,7 +41,11 @@ async function request<T>(path: string, token: string, method = "GET", body?: ob
       ...(body ? { body: JSON.stringify(body) } : {}), redirect: "error", signal: AbortSignal.timeout(10000),
     });
   } catch { return fail(502, "GITHUB_UNAVAILABLE", "GitHub 응답을 확인하지 못했습니다. 잠시 후 다시 확인해주세요."); }
-  if ([401, 403, 404].includes(response.status))
+  if (response.status === 401)
+    fail(503, "GITHUB_PROJECT_AUTH_INVALID", "서버 GitHub 인증이 실패했습니다. 관리자가 App ID·개인 키 또는 서버 토큰을 확인해야 합니다.");
+  if (response.status === 404)
+    fail(409, "GITHUB_PROJECT_RESOURCE_UNAVAILABLE", "저장소 또는 PR을 찾을 수 없거나 GitHub App 설치 접근이 허용되지 않았습니다. 관리자에게 주소와 설치 대상 저장소 확인을 요청해주세요.");
+  if (response.status === 403)
     fail(409, "GITHUB_PROJECT_ACCESS_REQUIRED", "프로젝트 관리자가 GitHub App 설치 대상 저장소와 Contents·Pull requests 읽기/쓰기 권한의 설치 승인 여부를 확인해야 합니다.");
   if (!response.ok) fail(409, "GITHUB_REJECTED", "GitHub 요청이 거절됐습니다. PR 상태, 충돌, 필수 검사와 연동 권한을 확인해주세요.");
   return response.json() as Promise<T>;

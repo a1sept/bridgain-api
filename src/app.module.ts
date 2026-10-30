@@ -1,3 +1,5 @@
+import { RepositoryAccessController } from "./workspace/repository-access.controller.js";
+import { RepositoryAccessService } from "./workspace/repository-access.service.js";
 import { ActivityController } from "./workspace/activity.controller.js";
 import { ActivityService } from "./workspace/activity.service.js";
 import { ChannelController } from "./workspace/channel.controller.js";
@@ -29,6 +31,7 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    RepositoryAccessController,
     ActivityController,
     ChannelController,
     StagedWorkController,
@@ -45,6 +48,7 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    RepositoryAccessService,
     ActivityService,
     ChannelService,
     StagedWorkService,

@@ -383,11 +383,15 @@ export class GithubConnectionService {
         "GitHub에 연결하지 못했어요. 다시 시도해주세요.",
       );
     }
-    if ([401, 403, 404].includes(response.status))
+    if (response.status === 401)
+      fail(409, "GITHUB_CONNECT_REQUIRED", "GitHub 인증이 만료되었거나 취소되었습니다. 내 GitHub 계정을 다시 연결해주세요.");
+    if (response.status === 404)
+      fail(404, "GITHUB_RESOURCE_UNAVAILABLE", "저장소 또는 PR이 없거나 현재 GitHub 계정에 공개되지 않았습니다. 주소와 협업자·앱 설치 권한을 확인해주세요.");
+    if (response.status === 403)
       fail(
         403,
         "GITHUB_ACCESS_DENIED",
-        "GitHub 접근 권한을 확인하고 다시 연결해주세요.",
+        "GitHub 요청이 권한 또는 사용 제한으로 거절되었습니다. 저장소 협업자 권한과 GitHub App 설치 권한 승인을 확인해주세요.",
       );
     if (!response.ok)
       fail(

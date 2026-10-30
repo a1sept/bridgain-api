@@ -76,7 +76,7 @@ test('GitHub revocation and network failures yield sanitized errors', async () =
   db.rows.set('user', { token: seal('token', Buffer.from('ab'.repeat(32), 'hex')), expiresAt: new Date(Date.now() + 3600000) });
   const service = new GithubConnectionService(db);
   globalThis.fetch = async () => new Response('secret-token', { status: 401 });
-  await assert.rejects(service.repositories('user'), e => e.getStatus() === 403 && !e.message.includes('secret-token'));
+  await assert.rejects(service.repositories('user'), e => e.getStatus() === 409 && e.response.code === 'GITHUB_CONNECT_REQUIRED' && !e.message.includes('secret-token'));
   globalThis.fetch = async () => { throw Error('secret-token'); };
   await assert.rejects(service.repositories('user'), e => e.getStatus() === 502 && !e.message.includes('secret-token'));
 });
@@ -255,4 +255,15 @@ test('desktop completion and cancellation require CSRF and use only the session 
   await controller.desktopComplete(req, { setHeader() {} }, {state: 's', claimSecret: 'secret', confirm: true});
   await controller.desktopCancel(req, {}, {state: 's', claimSecret: 'secret'});
   assert.deepEqual(calls, [['actor','s','secret',false], ['actor','s','secret',true], ['actor','s','secret']]);
+});
+
+test('GitHub API distinguishes authentication, authorization and hidden resource errors', async () => {
+  const oldFetch = globalThis.fetch;
+  const service = new GithubConnectionService({});
+  try {
+    for (const [status, code] of [[401,'GITHUB_CONNECT_REQUIRED'],[403,'GITHUB_ACCESS_DENIED'],[404,'GITHUB_RESOURCE_UNAVAILABLE']]) {
+      globalThis.fetch = async () => new Response('secret-token', {status});
+      await assert.rejects(service.api('/repos/example/repo','test'), e=>e.response.code===code && !JSON.stringify(e.response).includes('secret-token'));
+    }
+  } finally { globalThis.fetch = oldFetch; }
 });

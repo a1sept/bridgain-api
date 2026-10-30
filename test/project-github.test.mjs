@@ -49,6 +49,10 @@ test('project App credentials are scoped by trusted project grant, repository an
     await assert.rejects(projectGithubRequest('p',repo,'/pulls/1'), e=>e.response.code==='GITHUB_PROJECT_ACCESS_REQUIRED');
     badInstallation=false; expired=true;
     await assert.rejects(projectGithubRequest('p',repo,'/pulls/1'), e=>e.response.code==='GITHUB_UNAVAILABLE');
+    for (const [status, code] of [[401,'GITHUB_PROJECT_AUTH_INVALID'],[403,'GITHUB_PROJECT_ACCESS_REQUIRED'],[404,'GITHUB_PROJECT_RESOURCE_UNAVAILABLE']]) {
+      global.fetch=async()=>new Response('SECRET ERROR', {status});
+      await assert.rejects(projectGithubRequest('p',repo,'/pulls/1'), e=>e.response.code===code && !JSON.stringify(e.response).includes('SECRET'));
+    }
     global.fetch=async()=>new Response('SECRET ERROR', {status:403});
     await assert.rejects(projectGithubRequest('p',repo,'/pulls/1'), e=>e.response.code==='GITHUB_PROJECT_ACCESS_REQUIRED' && !JSON.stringify(e.response).includes('SECRET'));
   } finally { global.fetch=oldFetch; for(const n of names) old[n]===undefined ? delete process.env[n] : process.env[n]=old[n]; }

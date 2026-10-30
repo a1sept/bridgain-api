@@ -13,3 +13,5 @@ export * from "./project-roles.js";
 export * from "./channel.js";
 
 export * from "./activity.js";
+
+export * from "./repository-access.js";
