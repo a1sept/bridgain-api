@@ -1,3 +1,7 @@
+import { createRequire } from "node:module";
+import { limitedMemoryStorage } from "./requests.controller.js";
+import type { Upload } from "./requests.service.js";
+const multer = createRequire(import.meta.url)("multer");
 import { fail } from "../auth/security.js";
 import { TaskReviewService } from "./task-review.service.js";
 import {
@@ -51,6 +55,23 @@ export class ProjectWorkController {
     if (typeof b?.expectedVersion !== "string")
       fail(409, "TASK_VERSION_REQUIRED", "최신 업무를 다시 열어 저장해주세요.");
     return this.work.saveTask(user, pid, b, id);
+  }
+  @Get("tasks/:id/attachments") async taskFiles(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string) {
+    return this.work.taskFiles(await this.workspace.user(req, res), pid, id);
+  }
+  @Post("tasks/:id/attachments") async uploadTaskFiles(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string) {
+    const user = await this.workspace.user(req, res, true);
+    await this.work.taskFiles(user, pid, id);
+    await new Promise<void>((resolve, reject) => multer({storage: limitedMemoryStorage(20 * 1024 * 1024), limits: {fileSize: 20 * 1024 * 1024, files: 5, fields: 0, parts: 5}}).array("files", 5)(req, res, (error: unknown) => error ? reject(error) : resolve()))
+      .catch(() => fail(400, "FILE_LIMIT", "PDF, PNG, JPG 최대 5개, 합계 20MB까지 첨부해주세요."));
+    return this.work.taskFiles(user, pid, id, (req as Request & { files: Upload[] }).files);
+  }
+  @Get("tasks/:id/attachments/:fileId") async downloadTaskFile(@Req() req: Request, @Res() res: Response, @Param("projectId") pid: string, @Param("id") id: string, @Param("fileId") fileId: string) {
+    const { file } = await this.work.taskFiles(await this.workspace.user(req, res), pid, id, undefined, fileId);
+    res.setHeader("Content-Type", file!.mimeType);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Disposition", `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(file!.name).replace(/'/g, "%27")}`);
+    res.send(file!.content);
   }
   @Get("tasks/:id/result-entries") async resultEntries(
     @Req() req: Request,

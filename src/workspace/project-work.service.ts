@@ -1,3 +1,4 @@
+import { hasPendingPredecessors, requirePredecessors } from "./task-dependencies.js";
 import { dueDate } from "./due-date.js";
 export { dueDate } from "./due-date.js";
 import { meetingDocument } from "./meeting-document.js";
@@ -23,6 +24,7 @@ import {
   requestWorkflowLinks,
   taskApprovals,
   taskResultEntries,
+  taskAttachments,
   taskReviewEvents,
   meetingRequests,
   documentVersions,
@@ -38,6 +40,8 @@ import {
 } from "../db/schema/project-work.js";
 import {
   RequestsService,
+  validateUpload,
+  type Upload,
   requireProjectPermission,
 } from "./requests.service.js";
 import { bounded, uuid } from "./workspace.service.js";
@@ -244,6 +248,7 @@ export class ProjectWorkService {
             .where(eq(taskRequests.taskId, row.id));
     return {
       ...row,
+      waitingForPredecessors: await hasPendingPredecessors(tx, row.projectId, row.id),
       resultEntries: await tx
         .select({ entry: taskResultEntries, actorName: users.displayName })
         .from(taskResultEntries)
@@ -258,6 +263,8 @@ export class ProjectWorkService {
                 id: documentVersions.id,
                 documentId: documentVersions.documentId,
                 title: documentVersions.title,
+                content: documentVersions.content,
+                url: documentVersions.url,
                 changeSummary: documentVersions.changeSummary,
                 createdAt: documentVersions.createdAt,
               })
@@ -439,6 +446,7 @@ export class ProjectWorkService {
         );
       const current = old ? await this.taskOutput(tx, old) : undefined;
       if (old?.stageKey) {
+        await requirePredecessors(tx, pid, old.id);
         if (gitEvent)
           fail(
             409,
@@ -1478,6 +1486,32 @@ export class ProjectWorkService {
         .where(eq(users.id, row.createdBy));
       return { document: { ...row, creatorName: creator.name } };
     }, existingTx);
+  }
+  async taskFiles(u: User, pid: string, id: string, files?: Upload[], fileId?: string) {
+    if (files && (!files.length || files.length > 5)) fail(400, "FILE_LIMIT", "파일을 1~5개 선택해주세요.");
+    const names = files?.map(validateUpload);
+    return this.database.db.transaction(async tx => {
+      await this.access(tx, u, pid, !!files, files ? "tasks.progress" : "tasks.read");
+      const [task] = await tx.select().from(tasks).where(and(eq(tasks.id, uuid(id)), eq(tasks.projectId, pid))).for("update");
+      if (!task) fail(404, "NOT_FOUND", "업무를 찾을 수 없습니다.");
+      if (fileId) {
+        const [file] = await tx.select().from(taskAttachments).where(and(eq(taskAttachments.id, uuid(fileId)), eq(taskAttachments.taskId, id)));
+        if (!file) fail(404, "NOT_FOUND", "파일을 찾을 수 없습니다.");
+        return { file };
+      }
+      const list = () => tx.select({ id: taskAttachments.id, name: taskAttachments.name, size: taskAttachments.size, createdAt: taskAttachments.createdAt }).from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(desc(taskAttachments.createdAt));
+      if (files) {
+        const assigned = await tx.select().from(taskAssignees).where(eq(taskAssignees.taskId, id));
+        if (!assigned.some(a => a.userId === u.id)) fail(403, "TASK_ASSIGNEE_REQUIRED", "배정된 담당자만 첨부할 수 있습니다.");
+        if (!["todo", "in_progress"].includes(task.status) || assigned.some(a => a.completedAt)) fail(409, "WORK_LOCKED", "완료 제출한 작업은 수정할 수 없습니다.");
+        await requirePredecessors(tx, pid, id);
+        const existing = await list();
+        if (existing.length + files.length > 5 || [...existing, ...files].reduce((sum, f) => sum + f.size, 0) > 20 * 1024 * 1024) fail(400, "FILE_LIMIT", "첨부는 최대 5개, 합계 20MB까지 가능합니다.");
+        await tx.insert(taskAttachments).values(files.map((f, i) => ({taskId: id, name: names![i], mimeType: f.mimetype, size: f.size, content: f.buffer, createdBy: u.id})));
+        await this.event(tx, u, pid, id, "task_attachment_added", `파일 ${files.length}개 첨부`);
+      }
+      return { attachments: await list() };
+    });
   }
   async applyGitEvent(event: GitEvent) {
     if (!/^[a-f0-9]{40}$/i.test(event.commit))

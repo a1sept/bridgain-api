@@ -476,7 +476,7 @@ export class ApprovalService {
           requestId: plan.requestId,
           kind: "workflow_stage",
           status: "review",
-          body: "업무화 승인을 요청했습니다.",
+          body: source === "meeting" ? "회의 최종 승인을 요청했습니다." : "긴급 승인을 요청했습니다.",
           actorId: u.id,
         });
       }

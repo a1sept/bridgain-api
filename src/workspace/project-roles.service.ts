@@ -27,7 +27,7 @@ export const permissionCatalog = [
   ["tasks.read", "업무 조회", "업무"],
   ["tasks.assign", "업무 배정", "업무"],
   ["tasks.progress", "배정된 업무 진행", "업무"],
-  ["approvals.tasks", "업무화 승인", "승인"],
+  ["approvals.tasks", "회의 최종 승인", "승인"],
   ["approvals.merge", "병합 승인", "승인"],
   ["approvals.work", "작업 승인", "승인"],
   ["deploy.run", "배포하기", "배포"],

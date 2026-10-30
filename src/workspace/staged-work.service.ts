@@ -407,7 +407,7 @@ export class StagedWorkService {
           "NEW_REQUEST_REQUIRED",
           "완료된 업무의 변경은 새 개발 요청으로 등록해주세요.",
         );
-      if (action === "approve") await this.predecessors(tx, task, u);
+      if (action === "approve" || action === "complete") await this.predecessors(tx, task, u);
       const assigned = await tx
         .select()
         .from(taskAssignees)

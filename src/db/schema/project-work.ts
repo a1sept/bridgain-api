@@ -2,6 +2,7 @@ import type { RichDocument } from "../../workspace/rich-document.js";
 import { sql } from "drizzle-orm";
 import {
   pgTable,
+  customType,
   boolean,
   uniqueIndex,
   uuid,
@@ -470,3 +471,13 @@ export const projectStageSettings = pgTable("project_stage_settings", {
     .default([]),
   presets: jsonb("presets").$type<ProjectStagePreset[]>().notNull().default([]),
 });
+
+const attachmentBytes = customType<{ data: Buffer }>({ dataType: () => "bytea" });
+export const taskAttachments = pgTable("task_attachments", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  taskId: uuid("task_id").notNull().references(() => projectTasks.id, { onDelete: "cascade" }),
+  name: text("name").notNull(), mimeType: text("mime_type").notNull(), size: integer("size").notNull(),
+  content: attachmentBytes("content").notNull(),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("task_attachment_idx").on(t.taskId)]);

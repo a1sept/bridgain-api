@@ -459,11 +459,15 @@ test("standalone deployment checkpoint can complete with deployment URL and all 
 });
 
 
-test("unfinished predecessor permits completion and refresh but blocks final approval", async () => {
+test("unfinished predecessor permits refresh but blocks completion and final approval", async () => {
   const f = fixture({ status: "todo" });
   f.service.ancestorTasks = async () => [{ id: other, status: "in_progress", completionMode: "document" }];
   assert.equal((await f.service.act(u, pid, id, { action: "refresh" })).status, "todo");
-  assert.equal((await f.service.act(u, pid, id, { action: "complete", expectedRevision: 1 })).status, "review_pending");
+  await assert.rejects(
+    f.service.act(u, pid, id, { action: "complete", expectedRevision: 1 }),
+    e => e.response.code === "PREDECESSOR_REQUIRED",
+  );
+  assert.equal(f.assigned[0].completedAt, null);
   await assert.rejects(
     f.service.act(u, pid, id, { action: "approve", expectedRevision: 1 }),
     e => e.response.code === "PREDECESSOR_REQUIRED",

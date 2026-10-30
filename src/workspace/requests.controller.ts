@@ -22,7 +22,7 @@ const multer = require("multer") as (options: unknown) => {
   ) => (req: Request, res: Response, cb: (error?: unknown) => void) => void;
 };
 // Per-upload shared budget stops buffering before the combined limit is exceeded.
-function limitedMemoryStorage(limit: number) {
+export function limitedMemoryStorage(limit: number) {
   let total = 0;
   return {
     _handleFile(
