@@ -201,6 +201,7 @@ export class ApprovalService {
             stageName: projectTasks.stageName,
             status: projectTasks.status,
             workRevision: projectTasks.workRevision,
+            updatedAt: projectTasks.updatedAt,
           })
           .from(taskWorkReviewers)
           .innerJoin(
