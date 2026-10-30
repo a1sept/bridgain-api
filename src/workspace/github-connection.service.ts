@@ -14,7 +14,7 @@ import {
 import { and, eq, gt, lt } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
 import { githubConnections, githubStates } from "../db/schema/github.js";
-import { fail } from "../auth/security.js";
+import { equal, fail } from "../auth/security.js";
 
 export function seal(value: string, key: Buffer) {
   const iv = randomBytes(12);
@@ -63,6 +63,16 @@ export function validGithubCallback(callback: string): boolean {
     return false;
   }
 }
+type DesktopAuthorization = {
+  kind: "desktop";
+  phase: "pending" | "exchanging" | "ready" | "failed";
+  claimHash: string;
+  verifier?: string;
+  token?: string;
+  tokenExpiresAt?: string;
+  account?: { id: number; login: string };
+};
+const hashBase64 = (value: string) => createHash("sha256").update(value).digest("base64url");
 @Injectable()
 export class GithubConnectionService {
   constructor(private readonly database: DatabaseService) {}
@@ -122,11 +132,110 @@ export class GithubConnectionService {
         : null,
     };
   }
-  desktopConnect(userId: string) {
-    // The browser establishes its own session. Never transfer desktop cookies or tokens.
-    const url = new URL("/", this.config().callback);
-    url.hash = new URLSearchParams({ "github-connect": userId }).toString();
-    return { url: url.toString() };
+  async desktopConnect(userId: string) {
+    const c = this.config();
+    const state = `desktop.${randomBytes(32).toString("hex")}`;
+    const claimSecret = randomBytes(32).toString("hex");
+    const verifier = randomBytes(32).toString("base64url");
+    await this.database.db.delete(githubStates).where(lt(githubStates.expiresAt, new Date()));
+    await this.database.db.insert(githubStates).values({
+      state: hash(state), userId,
+      verifier: seal(JSON.stringify({ kind: "desktop", phase: "pending", verifier, claimHash: hash(claimSecret) }), c.key),
+      expiresAt: new Date(Date.now() + 600_000),
+    });
+    const url = new URL("https://github.com/login/oauth/authorize");
+    url.search = new URLSearchParams({ client_id: c.clientId, redirect_uri: c.callback,
+      state, code_challenge: hashBase64(verifier), code_challenge_method: "S256" }).toString();
+    return { url: url.toString(), state, claimSecret };
+  }
+  private desktopState(state: unknown): string {
+    if (typeof state !== "string" || !/^desktop\.[a-f0-9]{64}$/.test(state))
+      fail(400, "GITHUB_STATE_INVALID", "GitHub 연결을 다시 시작해주세요.");
+    return hash(state as string);
+  }
+  private desktopPayload(verifier: string): DesktopAuthorization {
+    try {
+      const value = JSON.parse(unseal(verifier, this.config().key));
+      if (value.kind === "desktop" && typeof value.claimHash === "string") return value;
+    } catch {}
+    return fail(400, "GITHUB_STATE_INVALID", "GitHub 연결을 다시 시작해주세요.");
+  }
+  async desktopCallback(state: unknown, code: unknown, error?: unknown) {
+    const key = this.desktopState(state), c = this.config();
+    const [row] = await this.database.db.select().from(githubStates)
+      .where(and(eq(githubStates.state, key), gt(githubStates.expiresAt, new Date())));
+    if (!row) fail(400, "GITHUB_STATE_INVALID", "연결 요청이 만료되었거나 취소됐어요.");
+    const payload = this.desktopPayload(row.verifier);
+    if (payload.phase !== "pending") fail(400, "GITHUB_STATE_INVALID", "이미 처리된 연결 요청이에요.");
+    const exchanging = seal(JSON.stringify({ ...payload, phase: "exchanging" }), c.key);
+    const [claimed] = await this.database.db.update(githubStates).set({ verifier: exchanging })
+      .where(and(eq(githubStates.state, key), eq(githubStates.verifier, row.verifier), gt(githubStates.expiresAt, new Date())))
+      .returning();
+    if (!claimed) fail(400, "GITHUB_STATE_INVALID", "이미 처리되었거나 취소된 연결 요청이에요.");
+    let terminal: DesktopAuthorization = { kind: "desktop", phase: "failed", claimHash: payload.claimHash };
+    if (error === undefined && typeof code === "string" && code.length > 0 && code.length <= 1024) {
+      try {
+        const response = await fetch("https://github.com/login/oauth/access_token", {
+          method: "POST", redirect: "error",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ client_id: c.clientId, client_secret: c.clientSecret,
+            redirect_uri: c.callback, code, code_verifier: payload.verifier }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok && typeof data.access_token === "string" && data.access_token) {
+          const lifetime = Number(data.expires_in);
+          const expiresAt = new Date(Date.now() + (Number.isFinite(lifetime) && lifetime > 0 ? Math.min(lifetime, 28800) : 28800) * 1000);
+          const account = await this.api("/user", data.access_token);
+          if (Number.isSafeInteger(account.id) && account.id > 0 && typeof account.login === "string" && /^[a-zA-Z0-9-]{1,39}$/.test(account.login))
+            terminal = { kind: "desktop", phase: "ready", claimHash: payload.claimHash,
+              token: data.access_token, tokenExpiresAt: expiresAt.toISOString(), account: { id: account.id, login: account.login } };
+        }
+      } catch { /* Store a terminal failure, never raw provider errors or credentials. */ }
+    }
+    // CAS prevents a cancelled/expired transaction from being resurrected after token exchange.
+    const [saved] = await this.database.db.update(githubStates)
+      .set({ verifier: seal(JSON.stringify(terminal), c.key) })
+      .where(and(eq(githubStates.state, key), eq(githubStates.verifier, exchanging), gt(githubStates.expiresAt, new Date())))
+      .returning();
+    if (!saved) fail(400, "GITHUB_STATE_INVALID", "연결 요청이 만료되었거나 취소됐어요.");
+    return { authorized: terminal.phase === "ready" };
+  }
+  private async desktopClaim(userId: string, state: unknown, claimSecret: unknown, cancel: boolean, confirm = false) {
+    const key = this.desktopState(state);
+    if (typeof claimSecret !== "string" || !/^[a-f0-9]{64}$/.test(claimSecret))
+      fail(400, "GITHUB_STATE_INVALID", "GitHub 연결을 다시 시작해주세요.");
+    return this.database.db.transaction(async tx => {
+      const [row] = await tx.select().from(githubStates)
+        .where(and(eq(githubStates.state, key), eq(githubStates.userId, userId), gt(githubStates.expiresAt, new Date())))
+        .for("update");
+      if (!row || row.expiresAt <= new Date()) fail(400, "GITHUB_STATE_INVALID", "연결 요청이 만료되었거나 이미 처리됐어요.");
+      const payload = this.desktopPayload(row.verifier);
+      if (!equal(payload.claimHash, hash(claimSecret as string)))
+        fail(400, "GITHUB_STATE_INVALID", "GitHub 연결 확인 정보가 일치하지 않아요.");
+      if (!cancel && ["pending", "exchanging"].includes(payload.phase)) return "pending";
+      if (!cancel && payload.phase === "ready" && !confirm && payload.account && payload.tokenExpiresAt && new Date(payload.tokenExpiresAt) > new Date())
+        return { connected: false as const, ready: true as const, account: payload.account };
+      await tx.delete(githubStates).where(eq(githubStates.state, key));
+      if (cancel) return "cancelled";
+      if (payload.phase !== "ready" || !payload.token || !payload.tokenExpiresAt || new Date(payload.tokenExpiresAt) <= new Date()) return "failed";
+      const token = seal(payload.token, this.config().key), expiresAt = new Date(payload.tokenExpiresAt);
+      await tx.insert(githubConnections).values({ userId, token, expiresAt })
+        .onConflictDoUpdate({ target: githubConnections.userId, set: { token, expiresAt } });
+      return "connected";
+    });
+  }
+  async desktopComplete(userId: string, state: unknown, claimSecret: unknown, confirm = false) {
+    const result = await this.desktopClaim(userId, state, claimSecret, false, confirm);
+    if (typeof result === "object") return result;
+    if (result === "pending") return { connected: false };
+    if (result !== "connected") fail(400, "GITHUB_AUTH_FAILED", "GitHub 인증이 완료되지 않았어요. 다시 연결해주세요.");
+    try { return { connected: true, installUrl: await this.installationUrlIfNeeded(userId) }; }
+    catch { return { connected: true, installUrl: null, repositoryCheckFailed: true }; }
+  }
+  async desktopCancel(userId: string, state: unknown, claimSecret: unknown) {
+    await this.desktopClaim(userId, state, claimSecret, true);
+    return { ok: true };
   }
   async connect(userId: string) {
     const status = await this.status(userId);

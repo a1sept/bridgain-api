@@ -81,28 +81,31 @@ test('GitHub revocation and network failures yield sanitized errors', async () =
   await assert.rejects(service.repositories('user'), e => e.getStatus() === 502 && !e.message.includes('secret-token'));
 });
 test('integration endpoints reject client and personal developer accounts', async () => {
-  const req = { get: () => 'developer' }; const res = {};
+  const req = { get: () => 'developer' }; const res = { setHeader() {} };
   const controller = new GithubConnectionController({ user: async () => ({ id: 'user', accountType: 'client' }) }, { status: () => { throw Error('unexpected'); } });
   await assert.rejects(controller.status(req, res), e => e.getStatus() === 403);
 });
 
-test('desktop handoff uses the configured callback origin without transferring credentials or starting OAuth', () => {
+test('desktop authorization uses PKCE and keeps the claim secret outside the browser URL', async () => {
   configure();
-  process.env.GITHUB_APP_CALLBACK_URL = 'https://bridgain.example/api/workspace/github/callback';
   const db = database();
   const service = new GithubConnectionService(db);
-  const userId = 'a62cba47-279e-47d3-acb6-501ae43f6ddb';
-  const { url } = service.desktopConnect(userId);
-  assert.equal(url, `https://bridgain.example/#github-connect=${userId}`);
-  assert.equal(new URL(url).search, '');
-  assert.equal(db.pending(), undefined);
+  const result = await service.desktopConnect('actor');
+  const url = new URL(result.url);
+  assert.equal(url.origin, 'https://github.com');
+  assert.match(result.state, /^desktop\.[a-f0-9]{64}$/);
+  assert.match(result.claimSecret, /^[a-f0-9]{64}$/);
+  assert.equal(url.searchParams.get('state'), result.state);
+  assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
+  assert.ok(!result.url.includes(result.claimSecret));
+  assert.ok(!db.pending().verifier.includes(result.claimSecret));
   assert.equal(db.rows.size, 0);
   process.env.GITHUB_APP_CALLBACK_URL = 'https://bridgain.example/wrong';
-  assert.throws(() => service.desktopConnect(userId), e => e.getStatus() === 503);
+  await assert.rejects(service.desktopConnect('actor'), e => e.getStatus() === 503);
 });
 
-test('desktop handoff requires the authenticated team actor and mutation protection', async () => {
-  const req = { get: () => 'developer' }; const res = {};
+test('desktop authorization requires the authenticated team actor and mutation protection', async () => {
+  const req = { get: () => 'developer' }; const res = { setHeader() {} };
   let calls = 0;
   const controller = new GithubConnectionController({
     user: async (request, response, mutation) => {
@@ -112,9 +115,9 @@ test('desktop handoff requires the authenticated team actor and mutation protect
       return { id: 'actor', accountType: 'team' };
     },
   }, {
-    desktopConnect: id => { calls++; assert.equal(id, 'actor'); return { url: 'https://bridgain.example/#github-connect=actor' }; },
+    desktopConnect: id => { calls++; assert.equal(id, 'actor'); return { url: 'https://github.com/login/oauth/authorize?state=desktop.test' }; },
   });
-  assert.deepEqual(await controller.desktopConnect(req, res), { url: 'https://bridgain.example/#github-connect=actor' });
+  assert.deepEqual(await controller.desktopConnect(req, res), { url: 'https://github.com/login/oauth/authorize?state=desktop.test' });
   const clientController = new GithubConnectionController({
     user: async () => ({ id: 'client', accountType: 'client' }),
   }, { desktopConnect: () => { calls++; } });
@@ -127,7 +130,7 @@ test('desktop handoff requires the authenticated team actor and mutation protect
 });
 
 test('connect rejects a browser session switched to another Bridgain account before starting OAuth', async () => {
-  const req = { get: () => 'developer' }; const res = {};
+  const req = { get: () => 'developer' }; const res = { setHeader() {} };
   const actors = [];
   const controller = new GithubConnectionController({
     user: async (_req, _res, mutation) => {
@@ -230,4 +233,30 @@ test('OAuth callback continues directly to installation instead of closing on an
   });
   await controller.callback({ get: () => 'developer' }, { redirect: url => { redirected = url; } }, 'state', 'code');
   assert.equal(redirected, 'https://github.com/apps/bridgain-test/installations/new');
+});
+
+
+test('desktop callback does not require a browser Bridgain session or claim to complete account binding', async () => {
+  let html;
+  const controller = new GithubConnectionController({ user: async () => { throw Error('browser session must not be required'); } }, {
+    desktopCallback: async (state, code, error) => { assert.equal(state, 'desktop.' + 'a'.repeat(64)); assert.equal(code, 'code'); assert.equal(error, undefined); return { authorized: true }; },
+  });
+  const res = { setHeader() {}, type: () => res, send: value => { html = value; } };
+  await controller.callback({}, res, 'desktop.' + 'a'.repeat(64), 'code');
+  assert.ok(html.includes('아직 계정 연결은 완료되지 않았어요'));
+});
+
+test('desktop completion and cancellation require CSRF and use only the session actor', async () => {
+  const calls = [];
+  const controller = new GithubConnectionController({ user: async (_req, _res, mutation) => {
+    assert.equal(mutation, true); return { id: 'actor', accountType: 'team' };
+  } }, {
+    desktopComplete: async (...args) => { calls.push(args); return { connected: false }; },
+    desktopCancel: async (...args) => { calls.push(args); return { ok: true }; },
+  });
+  const req = { get: () => 'developer' };
+  await controller.desktopComplete(req, { setHeader() {} }, {state: 's', claimSecret: 'secret', confirm: 'true', userId: 'forged'});
+  await controller.desktopComplete(req, { setHeader() {} }, {state: 's', claimSecret: 'secret', confirm: true});
+  await controller.desktopCancel(req, {}, {state: 's', claimSecret: 'secret'});
+  assert.deepEqual(calls, [['actor','s','secret',false], ['actor','s','secret',true], ['actor','s','secret']]);
 });

@@ -29,7 +29,25 @@ export class GithubConnectionController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
+    res.setHeader("Cache-Control", "no-store");
     return this.github.desktopConnect((await this.user(req, res, true)).id);
+  }
+  @Post("desktop-complete") async desktopComplete(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Body() body?: { state?: unknown; claimSecret?: unknown; confirm?: unknown },
+  ) {
+    const user = await this.user(req, res, true);
+    res.setHeader("Cache-Control", "no-store");
+    return this.github.desktopComplete(user.id, body?.state, body?.claimSecret, body?.confirm === true);
+  }
+  @Post("desktop-cancel") async desktopCancel(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Body() body?: { state?: unknown; claimSecret?: unknown },
+  ) {
+    const user = await this.user(req, res, true);
+    return this.github.desktopCancel(user.id, body?.state, body?.claimSecret);
   }
   @Post("connect") async connect(
     @Req() req: Request,
@@ -50,7 +68,15 @@ export class GithubConnectionController {
     @Res() res: Response,
     @Query("state") state: unknown,
     @Query("code") code: unknown,
+    @Query("error") error?: unknown,
   ) {
+    if (typeof state === "string" && state.startsWith("desktop.")) {
+      const result = await this.github.desktopCallback(state, code, error);
+      res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+      res.setHeader("Referrer-Policy", "no-referrer");
+      res.setHeader("Cache-Control", "no-store");
+      return res.type("html").send(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>GitHub 인증 확인</title></head><body><h1>${result.authorized ? "GitHub 인증을 확인했어요" : "GitHub 인증이 완료되지 않았어요"}</h1><p>${result.authorized ? "Bridgain 데스크톱 앱으로 돌아가 연결할 계정을 확인해주세요. 아직 계정 연결은 완료되지 않았어요." : "Bridgain 데스크톱 앱에서 다시 연결해주세요."}</p></body></html>`);
+    }
     const user = await this.user(req, res);
     await this.github.callback(user.id, state, code);
     const installationUrl = await this.github.installationUrlIfNeeded(user.id);
