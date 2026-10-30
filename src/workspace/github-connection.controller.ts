@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { WorkspaceController } from "./workspace.controller.js";
 import { GithubConnectionService } from "./github-connection.service.js";
@@ -25,11 +25,25 @@ export class GithubConnectionController {
   ) {
     return this.github.status((await this.user(req, res)).id);
   }
-  @Post("connect") async connect(
+  @Post("desktop-connect") async desktopConnect(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    return this.github.connect((await this.user(req, res, true)).id);
+    return this.github.desktopConnect((await this.user(req, res, true)).id);
+  }
+  @Post("connect") async connect(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @Body() body?: { expectedUserId?: unknown },
+  ) {
+    const user = await this.user(req, res, true);
+    if (body?.expectedUserId !== undefined && body.expectedUserId !== user.id)
+      fail(
+        409,
+        "GITHUB_ACCOUNT_MISMATCH",
+        "데스크톱 앱과 동일한 Bridgain 계정으로 다시 로그인해주세요.",
+      );
+    return this.github.connect(user.id);
   }
   @Get("callback") async callback(
     @Req() req: Request,

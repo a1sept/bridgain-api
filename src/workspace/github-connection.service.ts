@@ -122,6 +122,12 @@ export class GithubConnectionService {
         : null,
     };
   }
+  desktopConnect(userId: string) {
+    // The browser establishes its own session. Never transfer desktop cookies or tokens.
+    const url = new URL("/", this.config().callback);
+    url.hash = new URLSearchParams({ "github-connect": userId }).toString();
+    return { url: url.toString() };
+  }
   async connect(userId: string) {
     const status = await this.status(userId);
     if (status.connected) {

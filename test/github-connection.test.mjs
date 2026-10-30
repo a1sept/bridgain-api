@@ -86,6 +86,66 @@ test('integration endpoints reject client and personal developer accounts', asyn
   await assert.rejects(controller.status(req, res), e => e.getStatus() === 403);
 });
 
+test('desktop handoff uses the configured callback origin without transferring credentials or starting OAuth', () => {
+  configure();
+  process.env.GITHUB_APP_CALLBACK_URL = 'https://bridgain.example/api/workspace/github/callback';
+  const db = database();
+  const service = new GithubConnectionService(db);
+  const userId = 'a62cba47-279e-47d3-acb6-501ae43f6ddb';
+  const { url } = service.desktopConnect(userId);
+  assert.equal(url, `https://bridgain.example/#github-connect=${userId}`);
+  assert.equal(new URL(url).search, '');
+  assert.equal(db.pending(), undefined);
+  assert.equal(db.rows.size, 0);
+  process.env.GITHUB_APP_CALLBACK_URL = 'https://bridgain.example/wrong';
+  assert.throws(() => service.desktopConnect(userId), e => e.getStatus() === 503);
+});
+
+test('desktop handoff requires the authenticated team actor and mutation protection', async () => {
+  const req = { get: () => 'developer' }; const res = {};
+  let calls = 0;
+  const controller = new GithubConnectionController({
+    user: async (request, response, mutation) => {
+      assert.equal(request, req);
+      assert.equal(response, res);
+      assert.equal(mutation, true);
+      return { id: 'actor', accountType: 'team' };
+    },
+  }, {
+    desktopConnect: id => { calls++; assert.equal(id, 'actor'); return { url: 'https://bridgain.example/#github-connect=actor' }; },
+  });
+  assert.deepEqual(await controller.desktopConnect(req, res), { url: 'https://bridgain.example/#github-connect=actor' });
+  const clientController = new GithubConnectionController({
+    user: async () => ({ id: 'client', accountType: 'client' }),
+  }, { desktopConnect: () => { calls++; } });
+  await assert.rejects(clientController.desktopConnect(req, res), e => e.getStatus() === 403);
+  const rejectedController = new GithubConnectionController({
+    user: async () => { throw new Error('CSRF rejected'); },
+  }, { desktopConnect: () => { calls++; } });
+  await assert.rejects(rejectedController.desktopConnect(req, res), /CSRF rejected/);
+  assert.equal(calls, 1);
+});
+
+test('connect rejects a browser session switched to another Bridgain account before starting OAuth', async () => {
+  const req = { get: () => 'developer' }; const res = {};
+  const actors = [];
+  const controller = new GithubConnectionController({
+    user: async (_req, _res, mutation) => {
+      assert.equal(mutation, true);
+      return { id: 'session-user', accountType: 'team' };
+    },
+  }, { connect: async id => { actors.push(id); return { url: 'https://github.com/login/oauth/authorize' }; } });
+  for (const expectedUserId of ['other-user', '', null, 42, {}]) {
+    await assert.rejects(controller.connect(req, res, { expectedUserId }), e =>
+      e.getStatus() === 409 && e.getResponse().code === 'GITHUB_ACCOUNT_MISMATCH');
+  }
+  assert.deepEqual(actors, []);
+  await controller.connect(req, res, { expectedUserId: 'session-user' });
+  await controller.connect(req, res);
+  await controller.connect(req, res, {});
+  assert.deepEqual(actors, ['session-user', 'session-user', 'session-user']);
+});
+
 test('project creation and edits cannot persist a forged repository selection', async () => {
   const { WorkspaceController } = await import('../dist/workspace/workspace.controller.js');
   let writes = 0;
