@@ -76,7 +76,7 @@ export class StagedWorkService {
       revision: task.workRevision,
       createdAt: sql`clock_timestamp()`,
     }).returning();
-    const kind=({completed:task.completionMode==="test"?"qa_completed":"task_completed",approved:"task_approved",changes_requested:"task_changes_requested",invalidated:"task_invalidated",deploy_started:"deploy_ready",released:"deploy_completed",deploy_failed:"deploy_failed"} as Record<string,string>)[action] ?? "task_invalidated";
+    const kind=({completed:task.completionMode==="test"?"qa_completed":"task_completed",approved:"task_approved",changes_requested:"task_changes_requested",invalidated:"task_invalidated",merged:"deploy_ready",deploy_started:"deploy_started",released:"deploy_completed",deploy_failed:"deploy_failed"} as Record<string,string>)[action] ?? "task_invalidated";
     await recordTaskActivity(tx,task.id,actorId,kind,note,`work:${recorded.id}`,system);
 
   }
@@ -102,7 +102,7 @@ export class StagedWorkService {
   private async reset(tx: Tx, task: Task, actorId: string, note: string) {
     const children = await this.descendants(tx, task);
     if (
-      children.some((child) => ["deploying", "released"].includes(child.status))
+      task.mergeCommit || children.some((child) => !!child.mergeCommit || ["deploying", "released"].includes(child.status))
     )
       fail(
         409,
@@ -421,6 +421,11 @@ export class StagedWorkService {
         !votes.some((v) => v.userId === u.id)
       )
         fail(403, "REVIEWER_REQUIRED", "지정 승인자만 처리할 수 있습니다.");
+      if (task.mergeCommit) {
+        if (action === "approve" || action === "refresh")
+          return { status: task.status, mergeCommit: task.mergeCommit };
+        fail(409, "NEW_REQUEST_REQUIRED", "이미 main에 병합된 업무입니다. 변경은 새 업무로 등록해주세요.");
+      }
       if (action === "changes_requested") {
         await this.reset(tx, task, u.id, note);
         return { status: "in_progress" };
@@ -444,11 +449,12 @@ export class StagedWorkService {
       let head = "";
       if (task.completionMode === "code") {
         await this.uniquePr(tx, task);
-        const { pr } = await this.currentPr(task, false, u);
+        const { pr } = await this.currentPr(task, action === "approve", u);
         if (action === "complete" && b.expectedHeadSha && b.expectedHeadSha !== pr.head.sha)
           fail(409, "REMOTE_CHANGED", "제출 중 PR 커밋이 변경되었습니다. 다시 확인해주세요.");
         head = pr.head.sha;
-        if (task.reviewHeadSha && task.reviewHeadSha !== head) {
+        const reviewedHead = task.reviewHeadSha || task.approvedHeadSha;
+        if (reviewedHead && reviewedHead !== head) {
           await this.reset(
             tx,
             task,
@@ -457,6 +463,8 @@ export class StagedWorkService {
           );
           return { status: "in_progress", stale: true };
         }
+        if (action === "approve" && b.expectedHeadSha !== head)
+          fail(409, "REMOTE_CHANGED", "검토한 PR 커밋과 현재 코드가 다릅니다. 최신 변경 코드를 확인한 뒤 승인해주세요.");
       }
       if (action === "refresh") return { status: task.status };
       if (action === "complete") {
@@ -492,7 +500,8 @@ export class StagedWorkService {
         if(all) await recordTaskActivity(tx,task.id,u.id,"task_review_requested","담당자 전원이 작업을 완료하여 검토를 요청했습니다.");
         return { status };
       }
-      if (task.status !== "review_pending")
+      const legacyUnmerged = task.completionMode === "code" && task.status === "deploy_pending" && !task.mergeCommit;
+      if (task.status !== "review_pending" && !legacyUnmerged)
         fail(
           409,
           "INVALID_TRANSITION",
@@ -500,7 +509,8 @@ export class StagedWorkService {
         );
       if (!assigned.length || assigned.some((a) => !a.completedAt))
         fail(409, "COMPLETION_REQUIRED", "모든 담당자의 완료가 필요합니다.");
-      if (votes.find((v) => v.userId === u.id)?.status === "approved")
+      const retryMerge = task.completionMode === "code" && votes.every((v) => v.status === "approved");
+      if (votes.find((v) => v.userId === u.id)?.status === "approved" && !retryMerge)
         fail(409, "ALREADY_APPROVED", "이미 승인한 작업입니다.");
       for (const v of votes) {
         await this.eligibleReviewer(tx, u, pid, v.userId);
@@ -528,7 +538,9 @@ export class StagedWorkService {
           updatedAt: sql`clock_timestamp()`,
         })
         .where(eq(tasks.id, id));
-      await this.record(tx, task, u.id, "approved", note, head);
+      if (!retryMerge) await this.record(tx, task, u.id, "approved", note, head);
+      if (all && task.completionMode === "code")
+        return this.mergeApproved(tx, u, { ...task, status, approvedHeadSha: head });
       return { status };
     });
   }
@@ -545,6 +557,7 @@ export class StagedWorkService {
           .where(
             and(
               eq(tasks.projectId, pid),
+              sql`${tasks.mergeCommit} <> ''`,
               inArray(tasks.status, [
                 "deploy_pending",
                 "deploying",
@@ -600,149 +613,48 @@ export class StagedWorkService {
     return { results };
   }
   private async deployOne(u: User, pid: string, id: string) {
-    // The team lock serializes duplicates; retry reads GitHub first to recover an already merged PR.
     return this.database.db.transaction(async (tx) => {
       const task = await this.task(tx, u, pid, id, "deploy.run");
-      if (task.status === "released" || task.status === "deploying")
-        return { status: task.status };
-      if (task.status !== "deploy_pending")
-        fail(
-          409,
-          "INVALID_TRANSITION",
-          "승인이 완료된 배포 대기 업무만 배포할 수 있습니다.",
-        );
+      if (["released", "deploying"].includes(task.status)) return { status: task.status };
+      if (task.status !== "deploy_pending" || !/^[a-f0-9]{40}$/i.test(task.mergeCommit ?? ""))
+        fail(409, "MERGE_REQUIRED", "업무 승인 화면에서 main 병합을 완료한 뒤 배포를 시작해주세요.");
       await this.predecessors(tx, task, u);
-      const codeAncestors = (await this.ancestorTasks(tx, task)).filter(
-        (t) => t.completionMode === "code",
-      );
-      if (
-        codeAncestors.some(
-          (t) =>
-            !["deploying", "released"].includes(t.status) || !t.mergeCommit,
-        )
-      )
-        fail(
-          409,
-          "PREDECESSOR_DEPLOY_REQUIRED",
-          "선행 코드 업무를 먼저 배포 목록에서 적용해주세요.",
-        );
-      const votes = await tx
-        .select()
-        .from(reviewers)
-        .where(eq(reviewers.taskId, id));
-      if (!votes.length || votes.some((v) => v.status !== "approved"))
-        fail(409, "APPROVAL_REQUIRED", "전원 승인이 필요합니다.");
-      for (const v of votes) {
-        await this.eligibleReviewer(tx, u, pid, v.userId);
-      }
-      await this.uniquePr(tx, task);
-      const { path, pr } = await this.currentPr(task, true, u);
-      if (task.approvedHeadSha !== pr.head.sha) {
-        await this.reset(
-          tx,
-          task,
-          u.id,
-          "배포 전 PR 코드 변경 확인: 재승인이 필요합니다.",
-        );
-        return { status: "in_progress", stale: true };
-      }
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${"bridgain-pr:" + task.pullRequestUrl},0))`,
-      );
-      const [attempt] = await tx
-        .insert(attempts)
-        .values({
-          taskId: id,
-          actorId: u.id,
-          status: "pending",
-          headSha: pr.head.sha,
-        })
-        .returning();
-      if ((pr as PullRequest & { mergeable?: boolean }).mergeable === false) {
-        await this.reset(
-          tx,
-          task,
-          u.id,
-          "병합 충돌을 해결한 뒤 다시 승인받아주세요.",
-        );
-        await tx
-          .update(attempts)
-          .set({
-            status: "failed",
-            note: "병합 충돌",
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(attempts.id, attempt.id));
-        await recordTaskActivity(tx,task.id,u.id,"deploy_failed","병합 충돌",`attempt:${attempt.id}:failed`);
-        return {
-          status: "in_progress",
-          error: "병합 충돌로 재작업이 필요합니다.",
-        };
-      }
-      try {
-        const merged = pr.merged
-          ? { merged: true, sha: pr.merge_commit_sha }
-          : await this.taskGithub<{ merged: boolean; sha: string }>(task, u, `${path}/merge`, {
-              sha: pr.head.sha,
-              merge_method: "merge",
-            });
-        if (!merged.merged || !/^[a-f0-9]{40}$/i.test(merged.sha ?? "")) {
-          await this.reset(
-            tx,
-            task,
-            u.id,
-            "병합할 수 없습니다. 충돌과 검사를 확인한 뒤 다시 승인받아주세요.",
-          );
-          await tx
-            .update(attempts)
-            .set({
-              status: "failed",
-              note: "병합 거절: 재작업 필요",
-              updatedAt: sql`clock_timestamp()`,
-            })
-            .where(eq(attempts.id, attempt.id));
-          await recordTaskActivity(tx,task.id,u.id,"deploy_failed","병합 거절",`attempt:${attempt.id}:failed`);
-          return {
-            status: "in_progress",
-            error: "병합할 수 없어 재작업이 필요합니다.",
-          };
-        }
-        await tx
-          .update(tasks)
-          .set({
-            status: "deploying",
-            mergeCommit: merged.sha!,
-            version: randomUUID(),
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(tasks.id, id));
-        await tx
-          .update(attempts)
-          .set({ status: "merged", updatedAt: sql`clock_timestamp()` })
-          .where(eq(attempts.id, attempt.id));
-        await this.record(tx, task, u.id, "deploy_started", "", pr.head.sha);
-        return { status: "deploying" };
-      } catch (e: any) {
-        await tx
-          .update(attempts)
-          .set({
-            status: "failed",
-            note: String(
-              e?.response?.message ??
-                "GitHub 배포 결과를 확인하지 못했습니다. 재시도해주세요.",
-            ).slice(0, 5000),
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(attempts.id, attempt.id));
-        await recordTaskActivity(tx,task.id,u.id,"deploy_failed","배포 결과 확인 실패",`attempt:${attempt.id}:failed`);
-        return {
-          status: "deploy_pending",
-          error:
-            e?.response?.message ??
-            "배포 결과를 확인하지 못했습니다. 재시도해주세요.",
-        };
-      }
+      await tx.update(tasks).set({ status: "deploying", version: randomUUID(), updatedAt: sql`clock_timestamp()` }).where(eq(tasks.id, id));
+      await this.record(tx, task, u.id, "deploy_started", "", task.approvedHeadSha);
+      return { status: "deploying" };
     });
+  }
+  private async mergeApproved(tx: Tx, u: User, task: Task) {
+    const { path, pr } = await this.currentPr(task, true, u);
+    if (task.approvedHeadSha !== pr.head.sha) {
+      await this.reset(tx, task, u.id, "병합 전 PR 코드 변경 확인: 재승인이 필요합니다.");
+      return { status: "in_progress", stale: true };
+    }
+    const codeAncestors = (await this.ancestorTasks(tx, task)).filter(t => t.completionMode === "code");
+    if (codeAncestors.some(t => !t.mergeCommit))
+      fail(409, "PREDECESSOR_MERGE_REQUIRED", "선행 코드 업무의 main 병합을 먼저 완료해주세요.");
+    const [attempt] = await tx.insert(attempts).values({ taskId: task.id, actorId: u.id, status: "pending", headSha: pr.head.sha }).returning();
+    let merged: { merged: boolean; sha: string | null };
+    try {
+      if ((pr as PullRequest & { mergeable?: boolean }).mergeable === false && !pr.merged)
+        fail(409, "MERGE_CONFLICT", "병합 충돌을 해결하거나 재작업을 요청한 뒤 다시 시도해주세요.");
+      merged = pr.merged
+        ? { merged: true, sha: pr.merge_commit_sha }
+        : await this.taskGithub<{ merged: boolean; sha: string }>(task, u, `${path}/merge`, { sha: pr.head.sha, merge_method: "merge" });
+      if (!merged.merged || !/^[a-f0-9]{40}$/i.test(merged.sha ?? ""))
+        fail(409, "MERGE_REJECTED", "병합하지 못했습니다. 충돌·필수 검사·연동 권한을 확인한 뒤 다시 시도해주세요.");
+    } catch (e: any) {
+      const error = String(e?.response?.message ?? "GitHub 병합 결과를 확인하지 못했습니다. 다시 시도하면 기존 병합 여부부터 확인합니다.").slice(0, 5000);
+      await tx.update(tasks).set({ status: "review_pending", approvedHeadSha: task.approvedHeadSha, version: randomUUID(), updatedAt: sql`clock_timestamp()` }).where(eq(tasks.id, task.id));
+      await tx.update(attempts).set({ status: "failed", note: error, updatedAt: sql`clock_timestamp()` }).where(eq(attempts.id, attempt.id));
+      await recordTaskActivity(tx, task.id, u.id, "deploy_failed", error, `attempt:${attempt.id}:failed`);
+      return { status: "review_pending", mergeFailed: true, error };
+    }
+    // SQL failures must roll back rather than hide a successful external merge. Retry reads pr.merged.
+    await tx.update(tasks).set({ status: "deploy_pending", mergeCommit: merged.sha!, approvedHeadSha: task.approvedHeadSha, version: randomUUID(), updatedAt: sql`clock_timestamp()` }).where(eq(tasks.id, task.id));
+    await tx.update(attempts).set({ status: "merged", updatedAt: sql`clock_timestamp()` }).where(eq(attempts.id, attempt.id));
+    await this.record(tx, task, u.id, "merged", "승인된 PR이 main에 병합되어 배포 대기 중입니다.", pr.head.sha);
+    return { status: "deploy_pending", mergeCommit: merged.sha! };
   }
   async deployed(u: User, pid: string, id: string, b: Record<string, unknown>) {
     if (!b || typeof b !== "object" || Array.isArray(b))
@@ -784,6 +696,7 @@ export class StagedWorkService {
       if (
         !t.stageKey ||
         !t.reviewHeadSha ||
+        !!t.mergeCommit ||
         ["released", "deploying"].includes(t.status)
       )
         continue;
@@ -801,6 +714,8 @@ export class StagedWorkService {
           .for("update");
         if (
           current &&
+          !current.mergeCommit &&
+          !["deploying", "released"].includes(current.status) &&
           current.reviewHeadSha &&
           (current.reviewHeadSha !== pr.head?.sha ||
             pr.state !== "open" ||
@@ -824,24 +739,11 @@ export class StagedWorkService {
     const linked = await this.database.db
       .select()
       .from(tasks)
-      .where(
-        and(
-          eq(tasks.repositoryUrl, event.repository),
-          eq(tasks.status, "deploying"),
-        ),
-      );
+      .where(eq(tasks.repositoryUrl, event.repository));
     let updated = 0;
     for (const task of linked) {
-      if (
-        !task.stageKey ||
-        task.liveBranch !== event.branch ||
-        !task.mergeCommit ||
-        ![event.commit, ...(event.includedCommits ?? [])].includes(
-          task.mergeCommit,
-        )
-      )
-        continue;
-      await this.database.db.transaction(async (tx) => {
+      if (!task.stageKey) continue;
+      const applied = await this.database.db.transaction(async (tx) => {
         await tx
           .select({ id: teams.id })
           .from(teams)
@@ -855,10 +757,13 @@ export class StagedWorkService {
           .for("update");
         if (
           !current ||
-          current.status !== "deploying" ||
-          current.mergeCommit !== task.mergeCommit
+          !["deploy_pending", "deploying"].includes(current.status) ||
+          current.repositoryUrl !== event.repository ||
+          current.liveBranch !== event.branch ||
+          !current.mergeCommit ||
+          ![event.commit, ...(event.includedCommits ?? [])].includes(current.mergeCommit)
         )
-          return;
+          return false;
         await tx
           .update(tasks)
           .set({
@@ -877,8 +782,9 @@ export class StagedWorkService {
           "",
           true,
         );
+        return true;
       });
-      updated++;
+      if (applied) updated++;
     }
     return { updated };
   }

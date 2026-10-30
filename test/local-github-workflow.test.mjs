@@ -62,8 +62,8 @@ for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validatio
     assert.equal((await task()).status,"in_progress");assert.equal((await task()).pull_request_url,repo+"/pull/87");
     sha="b".repeat(40);pr.head.sha=sha;
     await service.submitPr(worker,pid,id,{headSha:sha,expectedRevision:(await task()).work_revision});assert.equal(created,1);
-    await service.act(reviewer,pid,id,{action:"approve",expectedRevision:(await task()).work_revision});
-    assert.equal((await task()).status,"deploy_pending");assert.equal(merged,0);
+    await service.act(reviewer,pid,id,{action:"approve",expectedHeadSha:sha,expectedRevision:(await task()).work_revision});
+    assert.equal((await task()).status,"deploy_pending");assert.equal(merged,1);
     await service.deploy(reviewer,pid,{taskIds:[id]});
     assert.equal(merged,1);assert.equal((await task()).status,"deploying");
     assert.ok(calls.some(c=>c.uid===worker.id&&c.method==="POST"));

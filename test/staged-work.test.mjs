@@ -340,58 +340,70 @@ function deployFixture() {
   f.setReviewers([{ userId: u.id, status: "approved" }]);
   return f;
 }
-test("manual batch deploy merges approved exact SHA, retains attempt, repeated deploy does not merge twice", () =>
+const approve = (f, expectedHeadSha = sha) => f.service.act(u, pid, id, { expectedRevision: 1, expectedHeadSha, action: "approve" });
+test("final approval merges exact reviewed SHA and deployment start never merges again", () =>
   withGithub(async (state, calls) => {
-    const f = deployFixture();
-    const result = await f.service.deploy(u, pid, { taskIds: [id] });
-    assert.equal(result.results[0].status, "deploying");
+    const f = deployFixture(); // Existing unmerged deploy_pending recovers through approval.
+    assert.equal((await approve(f)).status, "deploy_pending");
     assert.equal(f.task.mergeCommit, merged);
     assert.equal(f.attempts[0].status, "merged");
-    assert.equal(
-      JSON.parse(calls.find((c) => c.url.endsWith("/merge")).options.body).sha,
-      sha,
-    );
+    assert.equal(JSON.parse(calls.find(c => c.url.endsWith("/merge")).options.body).sha, sha);
+    await approve(f);
+    assert.equal((await f.service.deploy(u, pid, { taskIds: [id] })).results[0].status, "deploying");
     await f.service.deploy(u, pid, { taskIds: [id] });
-    assert.equal(calls.filter((c) => c.url.endsWith("/merge")).length, 1);
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 1);
   }));
-test("stale code invalidates votes and assignee completions without merge", () =>
+test("partial reviewer approval never merges; final reviewer does not require deploy.run", () =>
   withGithub(async (state, calls) => {
     const f = deployFixture();
-    state.pr.head.sha = "d".repeat(40);
-    const result = await f.service.deploy(u, pid, { taskIds: [id] });
-    assert.equal(result.results[0].status, "in_progress");
+    await f.tx.update(tasks).set({ status: "review_pending" });
+    f.setReviewers([{ userId: u.id, status: "pending" }, { userId: other, status: "pending" }]);
+    f.setPermissions(["tasks.read", "approvals.work"]);
+    assert.equal((await approve(f)).status, "review_pending");
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 0);
+    f.setReviewers([{ userId: u.id, status: "pending" }, { userId: other, status: "approved" }]);
+    assert.equal((await approve(f)).status, "deploy_pending");
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 1);
+  }));
+test("stale reviewed code resets votes; stale confirmation SHA cannot approve", () =>
+  withGithub(async (state, calls) => {
+    const f = deployFixture(); state.pr.head.sha = "d".repeat(40);
+    assert.equal((await approve(f)).status, "in_progress");
+    const staleUi = deployFixture(); state.pr.head.sha = sha;
+    await assert.rejects(approve(staleUi, "e".repeat(40)), e => e.response.code === "REMOTE_CHANGED");
     assert.equal(f.reviewers[0].status, "pending");
     assert.equal(f.assigned[0].completedAt, null);
-    assert.equal(calls.filter((c) => c.url.endsWith("/merge")).length, 0);
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 0);
   }));
-test("merge conflict requires rework; network ambiguity remains retryable", () =>
+test("conflict and network ambiguity remain in approval with retry; already merged PR is recovered", () =>
   withGithub(async (state, calls) => {
-    const f = deployFixture();
-    state.pr.mergeable = false;
-    assert.equal(
-      (await f.service.deploy(u, pid, { taskIds: [id] })).results[0].status,
-      "in_progress",
-    );
+    const f = deployFixture(); state.pr.mergeable = false;
+    assert.equal((await approve(f)).mergeFailed, true);
+    assert.equal(f.task.status, "review_pending");
     assert.equal(f.attempts[0].status, "failed");
-    state.pr.mergeable = true;
-    state.network = true;
-    const retry = deployFixture();
-    assert.equal(
-      (await retry.service.deploy(u, pid, { taskIds: [id] })).results[0].status,
-      "deploy_pending",
-    );
-    assert.equal(retry.attempts[0].status, "failed");
+    state.pr.mergeable = true; state.network = true;
+    assert.equal((await approve(f)).mergeFailed, true);
+    state.pr.merged = true; state.pr.merge_commit_sha = merged; state.pr.state = "closed";
+    assert.equal((await approve(f)).mergeCommit, merged);
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 1);
   }));
-test("mismatched base branch cannot be deployed and no Github merge is called", () =>
+test("deployment cannot merge legacy unmerged tasks", () => withGithub(async (state,calls) => {
+  const f = deployFixture();
+  assert.equal((await f.service.deploy(u,pid,{taskIds:[id]})).results[0].status,"failed");
+  assert.equal(calls.length,0);
+}));
+test("mismatched base branch cannot be approved and no Github merge is called", () =>
   withGithub(async (state, calls) => {
-    const f = deployFixture();
-    state.pr.base.ref = "production";
-    assert.equal(
-      (await f.service.deploy(u, pid, { taskIds: [id] })).results[0].status,
-      "failed",
-    );
-    assert.equal(calls.filter((c) => c.url.endsWith("/merge")).length, 0);
+    const f = deployFixture(); state.pr.base.ref = "production";
+    await assert.rejects(approve(f), e => e.response.code === "PR_CHANGED");
+    assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 0);
   }));
+test("merged deploy_pending tasks and descendants cannot be reopened", async () => {
+  const f=fixture({status:"deploy_pending",mergeCommit:merged});
+  await assert.rejects(f.service.act(u,pid,id,{action:"changes_requested",expectedRevision:1,note:"change"}), e=>e.response.code==="NEW_REQUEST_REQUIRED");
+  const ancestor=fixture({status:"done"}); ancestor.setDescendants([{...ancestor.task,id:other,status:"deploy_pending",mergeCommit:merged}]);
+  await assert.rejects(ancestor.service.reset(ancestor.tx,ancestor.task,u.id,"change"),e=>e.response.code==="NEW_REQUEST_REQUIRED");
+});
 test("batch deploy denies missing deploy permission before external calls", () =>
   withGithub(async (state, calls) => {
     const f = deployFixture();
@@ -485,6 +497,7 @@ test("predecessor rework leaves descendants actionable and invalidates previous 
 
 test("unfinished predecessor still prevents deployment", async () => {
   const f = deployFixture();
+  await f.tx.update(tasks).set({ mergeCommit: merged });
   f.service.ancestorTasks = async () => [{ id: other, status: "in_progress" }];
   const result = await f.service.deploy(u, pid, { taskIds: [id] });
   assert.equal(result.results[0].status, "failed");
@@ -496,4 +509,40 @@ test("completion no longer requires separate result and verification fields", as
   const f = fixture({ resultSummary: "", verification: "" });
   assert.equal((await f.service.act(u, pid, id, { action: "complete", expectedRevision: 1 })).status, "review_pending");
   assert.equal(f.reviewers.every(v => v.status === "pending"), true);
+});
+
+
+test("delayed unmerged PR webhook cannot invalidate merged deploy_pending", async () => {
+  const f = fixture({ completionMode: "code", status: "deploy_pending", mergeCommit: merged, reviewHeadSha: sha });
+  const result = await f.service.syncPullRequest({ repository: {html_url:f.task.repositoryUrl}, pull_request:{html_url:f.task.pullRequestUrl,head:{sha:"d".repeat(40)},state:"open"} });
+  assert.equal(result.updated,0); assert.equal(f.task.status,"deploy_pending"); assert.equal(f.events.length,0);
+});
+test("verified CI deployment can release merged pending without manual deployment start", async () => {
+  const f = fixture({ completionMode: "code", status: "deploy_pending", mergeCommit: merged, reviewHeadSha: sha, createdBy:u.id });
+  await f.service.applyGitEvent({kind:"deployment", repository:f.task.repositoryUrl,branch:"main",commit:merged,url:"https://preview.example.test"});
+  assert.equal(f.task.status,"released"); assert.equal(f.task.deploymentUrl,"https://preview.example.test");
+});
+
+test("code approval requires the exact SHA shown in confirmation", () => withGithub(async (state, calls) => {
+  const f = deployFixture();
+  await assert.rejects(f.service.act(u, pid, id, { action: "approve", expectedRevision: 1 }), e => e.response.code === "REMOTE_CHANGED");
+  assert.equal(calls.filter(c => c.url.endsWith("/merge")).length, 0);
+  assert.equal(f.attempts.length, 0);
+}));
+
+
+test("CI arriving during merge waits for locked task then uses committed merge SHA", async () => {
+  const f = fixture({ completionMode: "code", status: "review_pending", mergeCommit: "", reviewHeadSha: sha, createdBy: u.id });
+  const realTransaction = f.service.database.db.transaction;
+  f.service.database.db.transaction = async fn => {
+    await f.tx.update(tasks).set({ status: "deploy_pending", mergeCommit: merged });
+    return realTransaction(fn);
+  };
+  const result = await f.service.applyGitEvent({ kind:"deployment", repository:f.task.repositoryUrl, branch:"main", commit:merged, url:"https://preview.example.test" });
+  assert.equal(result.updated, 1); assert.equal(f.task.status, "released");
+});
+test("unmatched CI event does not claim a task was released", async () => {
+  const f = fixture({ completionMode:"code", status:"deploy_pending", mergeCommit:merged, createdBy:u.id });
+  assert.equal((await f.service.applyGitEvent({kind:"deployment",repository:f.task.repositoryUrl,branch:"main",commit:sha,url:"https://preview.example.test"})).updated,0);
+  assert.equal(f.task.status,"deploy_pending");
 });

@@ -1,7 +1,7 @@
 import { recordTaskActivity } from "./activity-record.js";
 import { recordRequestHandler } from "./request-handler.js";
 import { Injectable } from "@nestjs/common";
-import { and, eq, desc, inArray, sql } from "drizzle-orm";
+import { and, or, eq, desc, inArray, sql } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
 import { users } from "../db/schema/auth.js";
 import {
@@ -212,8 +212,12 @@ export class ApprovalService {
             and(
               eq(projectTasks.projectId, projectId),
               eq(taskWorkReviewers.userId, u.id),
-              eq(taskWorkReviewers.status, "pending"),
-              eq(projectTasks.status, "review_pending"),
+              or(
+                and(eq(taskWorkReviewers.status, "pending"), eq(projectTasks.status, "review_pending")),
+                and(eq(projectTasks.completionMode, "code"), sql`${projectTasks.mergeCommit} = ''`,
+                  or(eq(projectTasks.status, "deploy_pending"), and(eq(projectTasks.status, "review_pending"),
+                    sql`not exists (select 1 from task_work_reviewers pending_vote where pending_vote.task_id = ${projectTasks.id} and pending_vote.status <> 'approved')`))),
+              ),
             ),
           );
         workApprovals.push(...pending.map((t) => ({ ...t, canApprove: true })));
