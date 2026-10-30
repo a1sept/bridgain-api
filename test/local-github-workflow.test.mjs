@@ -5,9 +5,10 @@ import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { StagedWorkService } from "../dist/workspace/staged-work.service.js";
 
-test("GitHub PR lifecycle: SHA validation, reuse after rework, approval and deployment with user credentials", { skip: !process.env.WORKFLOW_PGLITE_MODULE }, async () => {
+for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validation, rework, approval and deployment with ${serverAuth ? "project server" : "user"} credentials`, { skip: !process.env.WORKFLOW_PGLITE_MODULE }, async () => {
   const { PGlite } = await import(process.env.WORKFLOW_PGLITE_MODULE);
   const pg = new PGlite();
+  const oldFetch = global.fetch, oldGrants = process.env.GITHUB_PROJECT_REPOSITORIES, oldToken = process.env.GITHUB_MERGE_TOKEN;
   try {
     const journal = JSON.parse(await readFile(new URL("../drizzle/meta/_journal.json", import.meta.url), "utf8"));
     for (const e of journal.entries) await pg.exec(await readFile(new URL(`../drizzle/${e.tag}.sql`, import.meta.url), "utf8"));
@@ -39,7 +40,17 @@ test("GitHub PR lifecycle: SHA validation, reuse after rework, approval and depl
       throw Error(`Unexpected ${method} ${suffix}`);
     } };
     const requests = { access: async (_tx,u) => ({ isDeveloper:true,permissions: u.id === reviewer.id ? ["tasks.read","approvals.work","deploy.run"] : ["tasks.read","tasks.progress"] }) };
-    const service = new StagedWorkService(database, requests, connection);
+    if (serverAuth) {
+      process.env.GITHUB_PROJECT_REPOSITORIES = JSON.stringify({ [pid]: [repo] });
+      process.env.GITHUB_MERGE_TOKEN = "server-test";
+      global.fetch = async (url, options) => {
+        assert.equal(options.headers.Authorization, "Bearer server-test");
+        const suffix = String(url).slice("https://api.github.com/repos/example/project".length);
+        const body = options.body ? JSON.parse(options.body) : undefined;
+        return Response.json(await connection.repositoryRequest(suffix.endsWith("/merge") ? reviewer.id : worker.id, repo, suffix, options.method, body));
+      };
+    }
+    const service = new StagedWorkService(database, requests, serverAuth ? undefined : connection);
     const task = async () => (await pg.query("select * from project_tasks where id=$1",[id])).rows[0];
     await assert.rejects(service.gitContext(reviewer,pid,id,true), e=>e.getStatus()===403);
     await assert.rejects(service.submitPr(worker,pid,id,{headSha:"b".repeat(40),expectedRevision:1}),e=>e.getStatus()===409);
@@ -56,5 +67,10 @@ test("GitHub PR lifecycle: SHA validation, reuse after rework, approval and depl
     await service.deploy(reviewer,pid,{taskIds:[id]});
     assert.equal(merged,1);assert.equal((await task()).status,"deploying");
     assert.ok(calls.some(c=>c.uid===worker.id&&c.method==="POST"));
-  } finally { await pg.close(); }
+  } finally {
+    global.fetch = oldFetch;
+    oldGrants === undefined ? delete process.env.GITHUB_PROJECT_REPOSITORIES : process.env.GITHUB_PROJECT_REPOSITORIES = oldGrants;
+    oldToken === undefined ? delete process.env.GITHUB_MERGE_TOKEN : process.env.GITHUB_MERGE_TOKEN = oldToken;
+    await pg.close();
+  }
 });

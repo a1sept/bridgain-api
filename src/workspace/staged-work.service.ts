@@ -1,3 +1,4 @@
+import { projectGithubConfigured, projectGithubRequest } from "./project-github.js";
 import { recordTaskActivity } from "./activity-record.js";
 import { GithubConnectionService } from "./github-connection.service.js";
 import { randomUUID } from "node:crypto";
@@ -19,7 +20,6 @@ import {
 import { fail } from "../auth/security.js";
 import { bounded, uuid } from "./workspace.service.js";
 import {
-  github,
   pullRequestPath,
   checkPullRequest,
   type PullRequest,
@@ -239,16 +239,18 @@ export class StagedWorkService {
         "하나의 PR은 하나의 업무에만 연결할 수 있습니다.",
       );
   }
-  private async taskGithub<T>(task: Task, u: User | undefined, path: string, body?: object): Promise<T> {
-    if (u && this.githubConnection && (await this.githubConnection.status(u.id)).connected) {
-      const [project] = await this.database.db.select().from(projects).where(eq(projects.id, task.projectId));
-      if (!project?.repositoryUrls.includes(task.repositoryUrl!)) fail(403, "REPOSITORY_DENIED", "프로젝트 저장소를 확인해주세요.");
-      const prefix = `/repos/${task.repositoryUrl!.slice("https://github.com/".length)}`;
-      if (!path.startsWith(prefix + "/")) fail(400, "INVALID_PR", "PR 경로를 확인해주세요.");
-      return this.githubConnection.repositoryRequest(u.id, task.repositoryUrl!, path.slice(prefix.length), body ? "PUT" : "GET", body);
-    }
-    pullRequestPath(task.projectId, task.repositoryUrl, task.pullRequestUrl);
-    return github<T>(path, body);
+  private async taskGithub<T>(task: Task, u: User | undefined, path: string, body?: object, method = body ? "PUT" : "GET"): Promise<T> {
+    const [project] = await this.database.db.select().from(projects).where(eq(projects.id, task.projectId));
+    if (!task.repositoryUrl || !project?.repositoryUrls.includes(task.repositoryUrl))
+      fail(403, "REPOSITORY_DENIED", "프로젝트 저장소를 확인해주세요.");
+    const prefix = `/repos/${task.repositoryUrl!.slice("https://github.com/".length)}`;
+    if (!path.startsWith(prefix + "/")) fail(400, "INVALID_PR", "PR 경로를 확인해주세요.");
+    const suffix = path.slice(prefix.length);
+    if (projectGithubConfigured(task.projectId, task.repositoryUrl!))
+      return projectGithubRequest<T>(task.projectId, task.repositoryUrl!, suffix, method, body);
+    if (u && this.githubConnection && (await this.githubConnection.status(u.id)).connected)
+      return this.githubConnection.repositoryRequest(u.id, task.repositoryUrl!, suffix, method, body);
+    return projectGithubRequest<T>(task.projectId, task.repositoryUrl!, suffix, method, body);
   }
   private async currentPr(task: Task, allowMerged = false, u?: User) {
     if (task.liveBranch !== "main")
@@ -257,7 +259,7 @@ export class StagedWorkService {
       task.projectId,
       task.repositoryUrl,
       task.pullRequestUrl,
-      u && this.githubConnection ? [task.repositoryUrl!] : undefined,
+      [task.repositoryUrl!],
     );
     const pr = await this.taskGithub<PullRequest>(task, u, path);
     checkPullRequest(pr, task, allowMerged);
@@ -319,7 +321,6 @@ export class StagedWorkService {
     });
   }
   async submitPr(u: User, pid: string, id: string, b: Record<string, unknown>) {
-    if (!this.githubConnection) fail(503, "GITHUB_CONNECT_REQUIRED", "GitHub 연결을 설정해주세요.");
     if (!/^[a-f0-9]{40}$/i.test(String(b.headSha || ""))) fail(400, "INVALID_SHA", "로컬 커밋을 확인해주세요.");
     const result = await this.database.db.transaction(async tx => {
       const task = await this.task(tx, u, pid, id, "tasks.progress");
@@ -330,7 +331,7 @@ export class StagedWorkService {
       if (b.expectedRevision !== task.workRevision) fail(409, "STALE_REVISION", "업무가 변경되었습니다. 다시 확인해주세요.");
       if (!task.repositoryUrl || !project?.repositoryUrls.includes(task.repositoryUrl) || !task.workBranch || task.workBranch === task.liveBranch || task.liveBranch !== "main")
         fail(409, "BRANCH_REQUIRED", "프로젝트 저장소의 업무 브랜치를 먼저 연결해주세요.");
-      const request = (suffix: string, method = "GET", body?: object) => this.githubConnection!.repositoryRequest(u.id, task.repositoryUrl!, suffix, method, body);
+      const request = (suffix: string, method = "GET", body?: object) => this.taskGithub<any>(task, u, `/repos/${task.repositoryUrl!.slice("https://github.com/".length)}${suffix}`, body, method);
       const ref = await request(`/git/ref/heads/${encodeURIComponent(task.workBranch)}`);
       if (ref.object?.sha !== b.headSha) fail(409, "REMOTE_CHANGED", "로컬과 원격 커밋이 다릅니다. 동기화 후 제출해주세요.");
       const query = `/pulls?state=open&head=${encodeURIComponent(task.repositoryUrl!.split("/")[3] + ":" + task.workBranch)}&base=${encodeURIComponent(task.liveBranch)}`;

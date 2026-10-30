@@ -1,5 +1,4 @@
 import { repositoryRelations } from "./submodules.js";
-import { GithubConnectionService } from "./github-connection.service.js";
 import { projectRepositories } from "./project-repositories.js";
 import {
   Body,
@@ -22,7 +21,6 @@ export class WorkspaceController {
   constructor(
     private readonly auth: AuthService,
     private readonly workspace: WorkspaceService,
-    private readonly github: GithubConnectionService,
   ) {}
   async user(req: Request, res: Response, mutation = false) {
     const secret = process.env.AUTH_PROXY_SECRET;
@@ -79,15 +77,12 @@ export class WorkspaceController {
     @Body() body: Record<string, unknown>,
   ) {
     const user = await this.user(req, res, true);
-    await this.github.verify(
-      user.id,
-      projectRepositories(body.repositoryUrls ?? []),
-    );
+    // Project URLs are shared metadata. GitHub access is authorized separately
+    // against the server's project/repository binding when code is requested.
     const relations = repositoryRelations(
       body.repositoryRelations ?? [],
       projectRepositories(body.repositoryUrls ?? []),
     );
-    if (relations.length) await this.github.verifyRelations(user.id, relations);
     return this.workspace.create(user, {
       ...body,
       repositoryRelations: relations,
@@ -100,11 +95,6 @@ export class WorkspaceController {
     @Body() body: Record<string, unknown>,
   ) {
     const user = await this.user(req, res, true);
-    if (body.repositoryUrls !== undefined)
-      await this.github.verify(
-        user.id,
-        projectRepositories(body.repositoryUrls),
-      );
     if (body.repositoryRelations !== undefined) {
       if (body.repositoryUrls === undefined)
         fail(400, "VALIDATION_ERROR", "저장소 목록도 함께 보내주세요.");
@@ -112,8 +102,6 @@ export class WorkspaceController {
         body.repositoryRelations,
         projectRepositories(body.repositoryUrls),
       );
-      if (relations.length)
-        await this.github.verifyRelations(user.id, relations);
       body = { ...body, repositoryRelations: relations };
     }
     return this.workspace.update(user, id, body);

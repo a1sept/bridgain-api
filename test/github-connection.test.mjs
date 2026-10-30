@@ -149,22 +149,18 @@ test('connect rejects a browser session switched to another Bridgain account bef
   assert.deepEqual(actors, ['session-user', 'session-user', 'session-user']);
 });
 
-test('project creation and edits cannot persist a forged repository selection', async () => {
+test('project repository URL metadata does not require personal GitHub access', async () => {
   const { WorkspaceController } = await import('../dist/workspace/workspace.controller.js');
-  let writes = 0;
+  const saved = [];
   const controller = new WorkspaceController({}, {
-    create: async () => { writes++; }, update: async () => { writes++; },
-  }, { verify: async (userId, urls) => {
-    assert.equal(userId, 'actor');
-    if (urls.length) throw Error('access denied');
-  } });
+    create: async (user, body) => { saved.push(body.repositoryUrls); },
+    update: async (user, id, body) => { saved.push(body.repositoryUrls); },
+  });
   controller.user = async () => ({ id: 'actor', accountType: 'team' });
-  await assert.rejects(controller.create({}, {}, { repositoryUrls: ['https://github.com/other/private'] }), /access denied/);
-  await assert.rejects(controller.update({}, {}, 'project', { repositoryUrls: ['https://github.com/other/private'] }), /access denied/);
-  assert.equal(writes, 0);
-  await controller.create({}, {}, { repositoryUrls: [] });
-  await controller.update({}, {}, 'project', { name: 'Rename only' });
-  assert.equal(writes, 2);
+  const repositoryUrls = ['https://github.com/other/private'];
+  await controller.create({}, {}, { repositoryUrls });
+  await controller.update({}, {}, 'project', { repositoryUrls });
+  assert.deepEqual(saved, [repositoryUrls, repositoryUrls]);
 });
 
 test('external HTTP callback requires development mode and the configured frontend origin', async () => {

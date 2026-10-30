@@ -9,6 +9,7 @@ import {
   taskDependencies,
   taskDeploymentAttempts,
 } from "../dist/db/schema/project-work.js";
+import { projects } from "../dist/db/schema/workspace.js";
 import { users } from "../dist/db/schema/auth.js";
 const id = "00000000-0000-4000-8000-000000000001";
 const pid = "00000000-0000-4000-8000-000000000002";
@@ -62,7 +63,7 @@ function fixture(overrides = {}) {
     select: () => ({
       from: (table) =>
         chain(() =>
-          table === tasks
+          table === projects ? [{ id: pid, repositoryUrls: ["https://github.com/example/staged"] }] : table === tasks
             ? [task]
             : table === taskAssignees
               ? assigned
@@ -112,7 +113,7 @@ function fixture(overrides = {}) {
     execute: async () => {},
   };
   const service = new StagedWorkService(
-    { db: { transaction: (fn) => fn(tx) } },
+    { db: { ...tx, transaction: (fn) => fn(tx) } },
     { access: async () => ({ isDeveloper: true, permissions }) },
   );
   return {
