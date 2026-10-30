@@ -13,6 +13,7 @@ export function pullRequestPath(
   projectId: string,
   repository: string | null,
   url: string | null,
+  allowedRepositories?: string[],
 ) {
   const match =
     /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)$/.exec(
@@ -25,9 +26,9 @@ export function pullRequestPath(
     mappings = JSON.parse(process.env.GITHUB_PROJECT_REPOSITORIES || "{}");
   } catch {}
   if (
-    !mappings ||
+    !allowedRepositories?.includes(repository!) && (!mappings ||
     !Array.isArray(mappings[projectId]) ||
-    !(mappings[projectId] as unknown[]).includes(repository)
+    !(mappings[projectId] as unknown[]).includes(repository))
   )
     fail(
       503,

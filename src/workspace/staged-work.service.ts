@@ -1,4 +1,5 @@
 import { recordTaskActivity } from "./activity-record.js";
+import { GithubConnectionService } from "./github-connection.service.js";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { and, eq, inArray, sql, desc } from "drizzle-orm";
@@ -34,6 +35,7 @@ export class StagedWorkService {
   constructor(
     private readonly database: DatabaseService,
     private readonly requests: RequestsService,
+    private readonly githubConnection?: GithubConnectionService,
   ) {}
   private async task(
     tx: Tx,
@@ -175,7 +177,7 @@ export class StagedWorkService {
     }
     return found;
   }
-  private async predecessors(tx: Tx, task: Task) {
+  private async predecessors(tx: Tx, task: Task, u?: User) {
     const deps = await this.ancestorTasks(tx, task);
     if (
       deps.some(
@@ -192,7 +194,7 @@ export class StagedWorkService {
         predecessor.stageKey &&
         predecessor.status !== "released"
       ) {
-        const { pr } = await this.currentPr(predecessor, true);
+        const { pr } = await this.currentPr(predecessor, true, u);
         if (
           !predecessor.approvedHeadSha ||
           predecessor.approvedHeadSha !== pr.head.sha
@@ -237,15 +239,27 @@ export class StagedWorkService {
         "하나의 PR은 하나의 업무에만 연결할 수 있습니다.",
       );
   }
-  private async currentPr(task: Task, allowMerged = false) {
+  private async taskGithub<T>(task: Task, u: User | undefined, path: string, body?: object): Promise<T> {
+    if (u && this.githubConnection && (await this.githubConnection.status(u.id)).connected) {
+      const [project] = await this.database.db.select().from(projects).where(eq(projects.id, task.projectId));
+      if (!project?.repositoryUrls.includes(task.repositoryUrl!)) fail(403, "REPOSITORY_DENIED", "프로젝트 저장소를 확인해주세요.");
+      const prefix = `/repos/${task.repositoryUrl!.slice("https://github.com/".length)}`;
+      if (!path.startsWith(prefix + "/")) fail(400, "INVALID_PR", "PR 경로를 확인해주세요.");
+      return this.githubConnection.repositoryRequest(u.id, task.repositoryUrl!, path.slice(prefix.length), body ? "PUT" : "GET", body);
+    }
+    pullRequestPath(task.projectId, task.repositoryUrl, task.pullRequestUrl);
+    return github<T>(path, body);
+  }
+  private async currentPr(task: Task, allowMerged = false, u?: User) {
     if (task.liveBranch !== "main")
       fail(409, "MAIN_REQUIRED", "배포 대상 브랜치는 main이어야 합니다.");
     const path = pullRequestPath(
       task.projectId,
       task.repositoryUrl,
       task.pullRequestUrl,
+      u && this.githubConnection ? [task.repositoryUrl!] : undefined,
     );
-    const pr = await github<PullRequest>(path);
+    const pr = await this.taskGithub<PullRequest>(task, u, path);
     checkPullRequest(pr, task, allowMerged);
     return { path, pr };
   }
@@ -292,6 +306,70 @@ export class StagedWorkService {
       };
     });
   }
+  async gitContext(u: User, pid: string, id: string, write = false) {
+    return this.database.db.transaction(async tx => {
+      const task = await this.task(tx, u, pid, id, write ? "tasks.progress" : "tasks.read");
+      const [project] = await tx.select().from(projects).where(eq(projects.id, pid));
+      if (write) {
+        const [mine] = await tx.select().from(taskAssignees).where(and(eq(taskAssignees.taskId, id), eq(taskAssignees.userId, u.id)));
+        if (!mine || mine.completedAt || !["todo", "in_progress"].includes(task.status) || task.completionMode !== "code")
+          fail(403, "TASK_NOT_EDITABLE", "진행 가능한 코드 업무의 미완료 담당자만 작업할 수 있습니다.");
+      }
+      return { task, repositoryUrls: project?.repositoryUrls || [] };
+    });
+  }
+  async submitPr(u: User, pid: string, id: string, b: Record<string, unknown>) {
+    if (!this.githubConnection) fail(503, "GITHUB_CONNECT_REQUIRED", "GitHub 연결을 설정해주세요.");
+    if (!/^[a-f0-9]{40}$/i.test(String(b.headSha || ""))) fail(400, "INVALID_SHA", "로컬 커밋을 확인해주세요.");
+    const result = await this.database.db.transaction(async tx => {
+      const task = await this.task(tx, u, pid, id, "tasks.progress");
+      const [mine] = await tx.select().from(taskAssignees).where(and(eq(taskAssignees.taskId, id), eq(taskAssignees.userId, u.id)));
+      const [project] = await tx.select().from(projects).where(eq(projects.id, pid));
+      if (!mine || mine.completedAt || !["todo", "in_progress"].includes(task.status) || task.completionMode !== "code")
+        fail(403, "TASK_NOT_EDITABLE", "진행 중인 코드 업무의 미완료 담당자만 제출할 수 있습니다.");
+      if (b.expectedRevision !== task.workRevision) fail(409, "STALE_REVISION", "업무가 변경되었습니다. 다시 확인해주세요.");
+      if (!task.repositoryUrl || !project?.repositoryUrls.includes(task.repositoryUrl) || !task.workBranch || task.workBranch === task.liveBranch || task.liveBranch !== "main")
+        fail(409, "BRANCH_REQUIRED", "프로젝트 저장소의 업무 브랜치를 먼저 연결해주세요.");
+      const request = (suffix: string, method = "GET", body?: object) => this.githubConnection!.repositoryRequest(u.id, task.repositoryUrl!, suffix, method, body);
+      const ref = await request(`/git/ref/heads/${encodeURIComponent(task.workBranch)}`);
+      if (ref.object?.sha !== b.headSha) fail(409, "REMOTE_CHANGED", "로컬과 원격 커밋이 다릅니다. 동기화 후 제출해주세요.");
+      const query = `/pulls?state=open&head=${encodeURIComponent(task.repositoryUrl!.split("/")[3] + ":" + task.workBranch)}&base=${encodeURIComponent(task.liveBranch)}`;
+      let pr: PullRequest;
+      if (task.pullRequestUrl) {
+        const path = pullRequestPath(pid, task.repositoryUrl, task.pullRequestUrl, project.repositoryUrls);
+        pr = await request(path.slice(`/repos/${task.repositoryUrl!.slice("https://github.com/".length)}`.length));
+      } else {
+        const found = await request(query);
+        pr = found[0];
+        if (!pr) {
+          try { pr = await request("/pulls", "POST", { title: task.title, head: task.workBranch, base: task.liveBranch, body: `Bridgain 업무: ${task.id}` }); }
+          catch (error) { const retry = await request(query); if (!retry[0]) throw error; pr = retry[0]; }
+        }
+      }
+      checkPullRequest(pr, { ...task, pullRequestUrl: pr.html_url });
+      if (pr.head.sha !== b.headSha) fail(409, "REMOTE_CHANGED", "PR 커밋이 변경되었습니다. 다시 확인해주세요.");
+      await this.uniquePr(tx, { ...task, pullRequestUrl: pr.html_url });
+      await tx.update(tasks).set({ pullRequestUrl: pr.html_url, version: randomUUID(), updatedAt: sql`clock_timestamp()` }).where(eq(tasks.id, id));
+      return { pullRequestUrl: pr.html_url, revision: task.workRevision };
+    });
+    // PR survives a failed completion request. Retrying reuses the same open PR.
+    const work = await this.act(u, pid, id, { action: "complete", expectedRevision: result.revision, expectedHeadSha: b.headSha });
+    if ("stale" in work && work.stale) fail(409, "PR_CHANGED", "PR 코드 변경으로 이전 완료·승인을 초기화했습니다. 최신 업무에서 다시 제출해주세요.");
+    return { ...result, work };
+  }
+  async remoteCode(u: User, pid: string, id: string) {
+    const { task, repositoryUrls } = await this.gitContext(u, pid, id);
+    if (!task.repositoryUrl || !task.pullRequestUrl || !repositoryUrls.includes(task.repositoryUrl))
+      fail(409, "PR_REQUIRED", "연결된 PR이 없습니다.");
+    const { path, pr } = await this.currentPr(task, true, u);
+    const files: any[] = [];
+    for (let page = 1; page <= 3; page++) {
+      const batch = await this.taskGithub<any[]>(task, u, `${path}/files?per_page=100&page=${page}`);
+      files.push(...batch.map(f => ({ path: f.filename, status: f.status, diff: String(f.patch || "바이너리 또는 큰 파일: GitHub에서 확인해주세요.").slice(0, 256000) })));
+      if (batch.length < 100) break;
+    }
+    return { headSha: pr.head.sha, approvedHeadSha: task.approvedHeadSha, pullRequestUrl: pr.html_url, files, limited: files.length >= 300 };
+  }
   async act(u: User, pid: string, id: string, b: Record<string, unknown>) {
     if (!b || typeof b !== "object" || Array.isArray(b))
       fail(400, "VALIDATION_ERROR", "작업 내용을 확인해주세요.");
@@ -328,7 +406,7 @@ export class StagedWorkService {
           "NEW_REQUEST_REQUIRED",
           "완료된 업무의 변경은 새 개발 요청으로 등록해주세요.",
         );
-      if (action === "approve") await this.predecessors(tx, task);
+      if (action === "approve") await this.predecessors(tx, task, u);
       const assigned = await tx
         .select()
         .from(taskAssignees)
@@ -365,7 +443,9 @@ export class StagedWorkService {
       let head = "";
       if (task.completionMode === "code") {
         await this.uniquePr(tx, task);
-        const { pr } = await this.currentPr(task);
+        const { pr } = await this.currentPr(task, false, u);
+        if (action === "complete" && b.expectedHeadSha && b.expectedHeadSha !== pr.head.sha)
+          fail(409, "REMOTE_CHANGED", "제출 중 PR 커밋이 변경되었습니다. 다시 확인해주세요.");
         head = pr.head.sha;
         if (task.reviewHeadSha && task.reviewHeadSha !== head) {
           await this.reset(
@@ -530,7 +610,7 @@ export class StagedWorkService {
           "INVALID_TRANSITION",
           "승인이 완료된 배포 대기 업무만 배포할 수 있습니다.",
         );
-      await this.predecessors(tx, task);
+      await this.predecessors(tx, task, u);
       const codeAncestors = (await this.ancestorTasks(tx, task)).filter(
         (t) => t.completionMode === "code",
       );
@@ -555,7 +635,7 @@ export class StagedWorkService {
         await this.eligibleReviewer(tx, u, pid, v.userId);
       }
       await this.uniquePr(tx, task);
-      const { path, pr } = await this.currentPr(task, true);
+      const { path, pr } = await this.currentPr(task, true, u);
       if (task.approvedHeadSha !== pr.head.sha) {
         await this.reset(
           tx,
@@ -601,7 +681,7 @@ export class StagedWorkService {
       try {
         const merged = pr.merged
           ? { merged: true, sha: pr.merge_commit_sha }
-          : await github<{ merged: boolean; sha: string }>(`${path}/merge`, {
+          : await this.taskGithub<{ merged: boolean; sha: string }>(task, u, `${path}/merge`, {
               sha: pr.head.sha,
               merge_method: "merge",
             });

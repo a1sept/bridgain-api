@@ -8,6 +8,18 @@ export class StagedWorkController {
     private readonly workspace: WorkspaceController,
     private readonly work: StagedWorkService,
   ) {}
+  @Get("tasks/:id/git/context") async gitContext(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string) {
+    return this.work.gitContext(await this.workspace.user(req, res), pid, id);
+  }
+  @Post("tasks/:id/git/context") async gitWriteContext(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string) {
+    return this.work.gitContext(await this.workspace.user(req, res, true), pid, id, true);
+  }
+  @Post("tasks/:id/git/submit") async submitPr(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string, @Body() body: Record<string, unknown>) {
+    return this.work.submitPr(await this.workspace.user(req, res, true), pid, id, body);
+  }
+  @Get("tasks/:id/git/code") async remoteCode(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Param("projectId") pid: string, @Param("id") id: string) {
+    return this.work.remoteCode(await this.workspace.user(req, res), pid, id);
+  }
   @Get("tasks/:id/work") async history(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,

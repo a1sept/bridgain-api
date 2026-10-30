@@ -246,11 +246,15 @@ export class GithubConnectionService {
       .where(eq(githubStates.userId, userId));
     return { ok: true };
   }
-  private async api(path: string, token: string): Promise<any> {
+  private async api(path: string, token: string, method = "GET", body?: object): Promise<any> {
     let response: Response;
     try {
       response = await fetch(`https://api.github.com${path}`, {
+        method,
+        redirect: "error",
+        body: body ? JSON.stringify(body) : undefined,
         headers: {
+          ...(body ? { "Content-Type": "application/json" } : {}),
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2026-03-10",
@@ -277,6 +281,15 @@ export class GithubConnectionService {
         "GitHub 데이터를 가져오지 못했어요. 잠시 후 다시 시도해주세요.",
       );
     return response.json();
+  }
+  async repositoryRequest(userId: string, repositoryUrl: string, suffix: string, method = "GET", body?: object): Promise<any> {
+    await this.verify(userId, [repositoryUrl]);
+    if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(repositoryUrl) || !suffix.startsWith("/") || suffix.includes(".."))
+      fail(400, "INVALID_GITHUB_PATH", "저장소 경로를 확인해주세요.");
+    const [row] = await this.database.db.select().from(githubConnections)
+      .where(and(eq(githubConnections.userId, userId), gt(githubConnections.expiresAt, new Date())));
+    if (!row) fail(409, "GITHUB_CONNECT_REQUIRED", "GitHub 연결이 만료되었습니다. 다시 연결해주세요.");
+    return this.api(`/repos/${repositoryUrl.slice("https://github.com/".length)}${suffix}`, unseal(row.token, this.config().key), method, body);
   }
   async repositories(userId: string): Promise<GithubRepository[]> {
     const c = this.config();
