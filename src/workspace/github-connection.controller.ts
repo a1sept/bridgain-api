@@ -72,10 +72,19 @@ export class GithubConnectionController {
   ) {
     if (typeof state === "string" && state.startsWith("desktop.")) {
       const result = await this.github.desktopCallback(state, code, error);
-      res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+      const nonce = randomBytes(24).toString("base64");
+      res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'`);
       res.setHeader("Referrer-Policy", "no-referrer");
       res.setHeader("Cache-Control", "no-store");
-      return res.type("html").send(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>GitHub 인증 확인</title></head><body><h1>${result.authorized ? "GitHub 인증을 확인했어요" : "GitHub 인증이 완료되지 않았어요"}</h1><p>${result.authorized ? "Bridgain 데스크톱 앱으로 돌아가 연결할 계정을 확인해주세요. 아직 계정 연결은 완료되지 않았어요." : "Bridgain 데스크톱 앱에서 다시 연결해주세요."}</p></body></html>`);
+      const title = result.authorized ? "GitHub 인증을 확인했어요" : "GitHub 인증이 완료되지 않았어요";
+      const message = result.authorized
+        ? "Bridgain 데스크톱 앱으로 돌아가 연결할 계정을 확인해주세요.<br>아직 계정 연결은 완료되지 않았어요."
+        : "Bridgain 데스크톱 앱에서 다시 연결해주세요.";
+      return res.type("html").send(
+        `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub 인증 확인</title>
+<style nonce="${nonce}">body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#e8edf5;font:16px system-ui,sans-serif}main{max-width:420px;padding:32px;text-align:center}.logo{display:grid;place-items:center;width:56px;height:56px;margin:0 auto 20px;border-radius:16px;background:#426fe9;color:#fff;font-size:34px;font-weight:750;line-height:1}h1{font-size:24px}p{line-height:1.7;color:#b5c0cf}</style></head>
+<body><main><div class="logo" aria-hidden="true">b</div><h1>${title}</h1><p>${message}</p></main></body></html>`,
+      );
     }
     const user = await this.user(req, res);
     await this.github.callback(user.id, state, code);
