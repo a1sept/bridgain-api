@@ -1,4 +1,3 @@
-import { projectGithubConfigured, projectGithubRequest } from "./project-github.js";
 import { recordTaskActivity } from "./activity-record.js";
 import { GithubConnectionService } from "./github-connection.service.js";
 import { randomUUID } from "node:crypto";
@@ -246,11 +245,11 @@ export class StagedWorkService {
     const prefix = `/repos/${task.repositoryUrl!.slice("https://github.com/".length)}`;
     if (!path.startsWith(prefix + "/")) fail(400, "INVALID_PR", "PR 경로를 확인해주세요.");
     const suffix = path.slice(prefix.length);
-    if (projectGithubConfigured(task.projectId, task.repositoryUrl!))
-      return projectGithubRequest<T>(task.projectId, task.repositoryUrl!, suffix, method, body);
-    if (u && this.githubConnection && (await this.githubConnection.status(u.id)).connected)
-      return this.githubConnection.repositoryRequest(u.id, task.repositoryUrl!, suffix, method, body);
-    return projectGithubRequest<T>(task.projectId, task.repositoryUrl!, suffix, method, body);
+    // Use the authenticated actor's GitHub grant for both submission and approval.
+    // Never borrow another member's token or silently fall back to server credentials.
+    if (!u || !this.githubConnection || !(await this.githubConnection.status(u.id)).connected)
+      fail(409, "GITHUB_CONNECT_REQUIRED", "업무 화면의 내 GitHub 계정 연결에서 본인 계정을 연결해주세요. PR 요청은 담당자, 승인·머지는 승인자의 GitHub 권한으로 처리합니다.");
+    return this.githubConnection!.repositoryRequest(u!.id, task.repositoryUrl!, suffix, method, body);
   }
   private async currentPr(task: Task, allowMerged = false, u?: User) {
     if (task.liveBranch !== "main")

@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { StagedWorkService } from "../dist/workspace/staged-work.service.js";
 
-for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validation, rework, approval and deployment with ${serverAuth ? "project server" : "user"} credentials`, { skip: !process.env.WORKFLOW_PGLITE_MODULE }, async () => {
+for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validation, rework, approval and deployment with user credentials ${serverAuth ? "despite legacy server settings" : "without server settings"}`, { skip: !process.env.WORKFLOW_PGLITE_MODULE }, async () => {
   const { PGlite } = await import(process.env.WORKFLOW_PGLITE_MODULE);
   const pg = new PGlite();
   const oldFetch = global.fetch, oldGrants = process.env.GITHUB_PROJECT_REPOSITORIES, oldToken = process.env.GITHUB_MERGE_TOKEN;
@@ -24,7 +24,8 @@ for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validatio
     await pg.query("insert into task_work_reviewers(task_id,user_id) values($1,$2)", [id, reviewer.id]);
     let sha = "a".repeat(40), pr, created = 0, merged = 0, injectFailure = true;
     const calls = [];
-    const connection = { status: async () => ({ connected: true }), repositoryRequest: async (uid, repository, suffix, method = "GET", body) => {
+    let connected = false;
+    const connection = { status: async () => ({ connected }), repositoryRequest: async (uid, repository, suffix, method = "GET", body) => {
       calls.push({uid,suffix,method}); assert.equal(repository, repo);
       if (suffix.startsWith("/git/ref/")) return { object: { sha } };
       if (suffix.startsWith("/pulls?")) return pr ? [pr] : [];
@@ -43,21 +44,21 @@ for (const serverAuth of [false, true]) test(`GitHub PR lifecycle: SHA validatio
     if (serverAuth) {
       process.env.GITHUB_PROJECT_REPOSITORIES = JSON.stringify({ [pid]: [repo] });
       process.env.GITHUB_MERGE_TOKEN = "server-test";
-      global.fetch = async (url, options) => {
-        assert.equal(options.headers.Authorization, "Bearer server-test");
-        const suffix = String(url).slice("https://api.github.com/repos/example/project".length);
-        const body = options.body ? JSON.parse(options.body) : undefined;
-        return Response.json(await connection.repositoryRequest(suffix.endsWith("/merge") ? reviewer.id : worker.id, repo, suffix, options.method, body));
-      };
+      global.fetch = async () => { throw Error("Server authentication must not be used"); };
     }
-    const service = new StagedWorkService(database, requests, serverAuth ? undefined : connection);
+    const service = new StagedWorkService(database, requests, connection);
     const task = async () => (await pg.query("select * from project_tasks where id=$1",[id])).rows[0];
     await assert.rejects(service.gitContext(reviewer,pid,id,true), e=>e.getStatus()===403);
+    await assert.rejects(service.submitPr(worker,pid,id,{headSha:sha,expectedRevision:1}), e=>e.response.code==="GITHUB_CONNECT_REQUIRED");
+    assert.equal(created,0); connected=true;
     await assert.rejects(service.submitPr(worker,pid,id,{headSha:"b".repeat(40),expectedRevision:1}),e=>e.getStatus()===409);
     assert.equal(created,0);
     const submitted = await service.submitPr(worker,pid,id,{headSha:sha,expectedRevision:1});
     assert.equal(submitted.pullRequestUrl,repo+"/pull/87");assert.equal(created,1);assert.equal((await task()).status,"review_pending");
     assert.equal((await service.remoteCode(reviewer,pid,id)).files[0].diff,"+ changed");
+    connected=false;
+    await assert.rejects(service.act(reviewer,pid,id,{action:"approve",expectedHeadSha:sha,expectedRevision:1}), e=>e.response.code==="GITHUB_CONNECT_REQUIRED");
+    assert.equal(merged,0); assert.equal((await task()).status,"review_pending"); connected=true;
     await service.act(reviewer,pid,id,{action:"changes_requested",note:"Please fix",expectedRevision:1});
     assert.equal((await task()).status,"in_progress");assert.equal((await task()).pull_request_url,repo+"/pull/87");
     sha="b".repeat(40);pr.head.sha=sha;

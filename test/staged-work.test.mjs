@@ -115,6 +115,11 @@ function fixture(overrides = {}) {
   const service = new StagedWorkService(
     { db: { ...tx, transaction: (fn) => fn(tx) } },
     { access: async () => ({ isDeveloper: true, permissions }) },
+    { status: async () => ({ connected: true }), repositoryRequest: async (uid, repository, suffix, method, body) => {
+      assert.equal(uid, u.id);
+      const response = await fetch(`https://api.github.com/repos/${repository.slice("https://github.com/".length)}${suffix}`, {method, body: body ? JSON.stringify(body) : undefined});
+      return response.json();
+    } },
   );
   return {
     service,
