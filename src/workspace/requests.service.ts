@@ -79,8 +79,10 @@ export class RequestsService {
   get db() {
     return this.database.db;
   }
-  async access(tx: Tx, u: User, pid: string, lock = false) {
-    return resolveProjectPermissions(tx, u, pid, lock);
+  async access(tx: Tx, u: User, pid: string, lock = false, scope: "development" | "channel" = "development") {
+    const access = await resolveProjectPermissions(tx, u, pid, lock);
+    if (access.kind === "study" && scope !== "channel") fail(404,"NOT_FOUND","개발 프로젝트 기능은 스터디에서 사용할 수 없습니다.");
+    return access;
   }
 
   private async record(

@@ -43,7 +43,7 @@ export class WorkspaceController {
       )
         fail(403, "CSRF_INVALID", "새로고침 후 다시 시도해주세요.");
     }
-    res.setHeader("Cache-Control", "no-store");
+    if (!res.headersSent) res.setHeader("Cache-Control", "no-store");
     return (await this.auth.me(app, jar[`bridgain_${app}_session`])).user;
   }
   @Get() async get(

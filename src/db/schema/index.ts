@@ -15,3 +15,4 @@ export * from "./channel.js";
 export * from "./activity.js";
 
 export * from "./repository-access.js";
+export * from './study.js';

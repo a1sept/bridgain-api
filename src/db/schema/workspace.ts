@@ -75,6 +75,7 @@ export const projects = pgTable(
     teamId: uuid("team_id")
       .notNull()
       .references(() => teams.id),
+    kind: text("kind").notNull().default("development"),
     name: text("name").notNull(),
     description: text("description").notNull().default(""),
     repositoryRelations: jsonb("repository_relations")
@@ -92,6 +93,7 @@ export const projects = pgTable(
     createdAt: created(),
   },
   (t) => [
+    check("project_kind_check", sql`${t.kind} IN ('development','study')`),
     check(
       "project_status_check",
       sql`${t.status} IN ('preparing','in_progress','completed')`,

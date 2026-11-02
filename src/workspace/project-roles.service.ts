@@ -1,3 +1,4 @@
+import { studyEffectivePermissions } from "./study-policy.js";
 import { Injectable } from "@nestjs/common";
 import { and, eq, inArray } from "drizzle-orm";
 import { DatabaseService } from "../db/database.service.js";
@@ -106,6 +107,8 @@ export async function resolveProjectPermissions(
 ) {
   const [m] = await tx
     .select({
+      kind: projects.kind,
+      createdBy: projects.createdBy,
       role: pm.accessRole,
       teamId: projects.teamId,
       rolesConfigured: pm.rolesConfigured,
@@ -126,6 +129,38 @@ export async function resolveProjectPermissions(
     m.role = fresh.accessRole;
     m.rolesConfigured = fresh.rolesConfigured;
     m.canApproveTasks = fresh.canApproveTasks;
+  }
+  if (m.kind === "study") {
+    if (u.accountType !== "team")
+      fail(403, "FORBIDDEN", "스터디 회원 계정이 필요합니다.");
+    const rs = await tx
+      .select({ permissions: roles.permissions })
+      .from(assigned)
+      .innerJoin(
+        roles,
+        and(
+          eq(roles.id, assigned.roleId),
+          eq(roles.projectId, assigned.projectId),
+        ),
+      )
+      .where(and(eq(assigned.projectId, pid), eq(assigned.userId, u.id)));
+    const isOwner = m.createdBy === u.id;
+    const permissions = studyEffectivePermissions(
+      isOwner,
+      rs.flatMap((r) => r.permissions),
+    );
+    return {
+      kind: "study" as const,
+      isDeveloper: false,
+      isOwner,
+      permissions,
+      rolesConfigured: true,
+      teamId: m.teamId,
+      canManage: permissions.includes("study.programs.manage"),
+      canManageRoles: permissions.includes("study.roles.manage"),
+      canApproveTasks: false,
+      canApproveMerge: false,
+    };
   }
   const [t] = await tx
     .select()
@@ -154,6 +189,7 @@ export async function resolveProjectPermissions(
     canApproveMerge: t?.canApproveMerge ?? false,
   });
   return {
+    kind: "development" as const,
     isDeveloper,
     isOwner,
     permissions,
@@ -259,7 +295,7 @@ export class ProjectRolesService {
     const value = roleDefinition(body, !!rid);
     return this.database.db.transaction(async (tx) => {
       const a = await resolveProjectPermissions(tx, u, pid, true);
-      if (!a.canManageRoles)
+      if (a.kind !== "development" || !a.canManageRoles)
         fail(403, "FORBIDDEN", "역할·권한 관리 권한이 필요합니다.");
       const [duplicate] = await tx
         .select()
@@ -288,7 +324,7 @@ export class ProjectRolesService {
     uuid(rid);
     return this.database.db.transaction(async (tx) => {
       const access = await resolveProjectPermissions(tx, u, pid, true);
-      if (!access.canManageRoles)
+      if (access.kind !== "development" || !access.canManageRoles)
         fail(403, "FORBIDDEN", "역할·권한 관리 권한이 필요합니다.");
       const [role] = await tx
         .select()
@@ -320,7 +356,7 @@ export class ProjectRolesService {
     return this.database.db.transaction(async (tx) => {
       const a = await resolveProjectPermissions(tx, u, pid, true);
       // Assigning roles grants privileges, so only role administrators may perform it.
-      if (!a.canManageRoles)
+      if (a.kind !== "development" || !a.canManageRoles)
         fail(403, "FORBIDDEN", "역할·권한 관리 권한이 필요합니다.");
       const target = await resolveProjectPermissions(
         tx,

@@ -26,7 +26,8 @@ export class ChannelService {
     private readonly requests: RequestsService,
   ) {}
   private async context(tx: Tx, u: User, pid: string) {
-    const access = await this.requests.access(tx, u, uuid(pid), true);
+    const access=await this.requests.access(tx,u,uuid(pid),true,"channel");
+    if(access.kind==="study")return {task:false,meeting:false,approval:false};
     return channelVisibility(access.isDeveloper, access.permissions);
   }
   private feed(

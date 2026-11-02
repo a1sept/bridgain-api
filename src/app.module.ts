@@ -1,3 +1,9 @@
+import {StudyEventsService} from "./workspace/study-events.service.js";
+import { StudyLiveService } from "./workspace/study-live.service.js";
+import { StudyDecksService } from "./workspace/study-decks.service.js";
+import { StudyAssetsService } from "./workspace/study-assets.service.js";
+import { StudyController } from "./workspace/study.controller.js";
+import { StudyService } from "./workspace/study.service.js";
 import { RepositoryAccessController } from "./workspace/repository-access.controller.js";
 import { RepositoryAccessService } from "./workspace/repository-access.service.js";
 import { ActivityController } from "./workspace/activity.controller.js";
@@ -31,6 +37,7 @@ import { DatabaseService } from "./db/database.service.js";
 import { HealthController } from "./health.controller.js";
 @Module({
   controllers: [
+    StudyController,
     RepositoryAccessController,
     ActivityController,
     ChannelController,
@@ -48,6 +55,11 @@ import { HealthController } from "./health.controller.js";
     GitEventsController,
   ],
   providers: [
+    StudyEventsService,
+    StudyLiveService,
+    StudyDecksService,
+    StudyAssetsService,
+    StudyService,
     RepositoryAccessService,
     ActivityService,
     ChannelService,

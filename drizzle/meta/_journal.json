@@ -197,6 +197,20 @@
       "when": 1793227602227,
       "tag": "0030_task_attachments",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1793227602228,
+      "tag": "0031_study_projects",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1793227602229,
+      "tag": "0032_study_series_thumbnails",
+      "breakpoints": true
     }
   ]
 }

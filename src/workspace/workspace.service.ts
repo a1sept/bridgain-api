@@ -1,3 +1,5 @@
+import {studyRoleDefaults} from "../db/schema/study.js";
+import { studyRoleTemplates } from "./study-policy.js";
 import { recordRepositoryRegistrations } from "./repository-registration.js";
 import { defaultProjectRoles } from "./default-project-roles.js";
 import {
@@ -97,6 +99,21 @@ export class WorkspaceService {
       .from(projects)
       .where(eq(projects.id, uuid(projectId)));
     if (!p) fail(404, "NOT_FOUND", "프로젝트를 찾을 수 없습니다.");
+    if (p.kind === "study") {
+      await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, p.id))
+        .for("update");
+      const access = await resolveProjectPermissions(tx, u, p.id);
+      const required =
+        permission === "members.manage"
+          ? "study.members.invite"
+          : "study.settings.manage";
+      if (!access.permissions.includes(required))
+        fail(403, "FORBIDDEN", "스터디 관리 권한이 필요합니다.");
+      return p;
+    }
     await tx.select().from(teams).where(eq(teams.id, p.teamId)).for("update");
     const [t] = await tx
       .select()
@@ -125,7 +142,12 @@ export class WorkspaceService {
       ? await this.db.select().from(projects).where(inArray(projects.id, pids))
       : [];
     const visiblePids = ps.map((p) => p.id);
-    const visibleTids = [...new Set([...teamIds, ...ps.map((p) => p.teamId)])];
+    const visibleTids = [
+      ...new Set([
+        ...teamIds,
+        ...ps.filter((p) => p.kind !== "study").map((p) => p.teamId),
+      ]),
+    ];
     const tms = visibleTids.length
       ? await this.db
           .select({ m: tm, u: users })
@@ -178,7 +200,11 @@ export class WorkspaceService {
     );
     const managedPids = ps
       .filter((p) =>
-        projectAccess.get(p.id)!.permissions.includes("members.manage"),
+        projectAccess
+          .get(p.id)!
+          .permissions.some((x) =>
+            ["members.manage", "study.members.invite"].includes(x),
+          ),
       )
       .map((p) => p.id);
     const invs = await this.db
@@ -221,7 +247,9 @@ export class WorkspaceService {
           : {}),
         canManage: projectAccess
           .get(p.id)!
-          .permissions.includes("members.manage"),
+          .permissions.some((x) =>
+            ["members.manage", "study.members.invite"].includes(x),
+          ),
         ...(u.accountType === "team"
           ? {
               permissions: projectAccess.get(p.id)!.permissions,
@@ -301,6 +329,19 @@ export class WorkspaceService {
   }
   async create(u: User, body: Record<string, unknown>) {
     this.teamUser(u);
+    const kind = body.kind ?? "development";
+    if (kind !== "development" && kind !== "study")
+      fail(400, "VALIDATION_ERROR", "프로젝트 종류를 확인해주세요.");
+    if (
+      kind === "study" &&
+      (body.teamId ||
+        (Array.isArray(body.repositoryUrls) && body.repositoryUrls.length))
+    )
+      fail(
+        400,
+        "VALIDATION_ERROR",
+        "스터디에는 개발팀 또는 저장소를 지정할 수 없습니다.",
+      );
     const name = bounded(body?.name, 120);
     const description = bounded(body?.description ?? "", 2000, false);
     const repositoryUrls = projectRepositories(body?.repositoryUrls ?? []);
@@ -332,7 +373,11 @@ export class WorkspaceService {
           .select({ id: users.id })
           .from(users)
           .where(
-            and(inArray(users.id, inviteeIds), eq(users.status, "active")),
+            and(
+              inArray(users.id, inviteeIds),
+              eq(users.status, "active"),
+              kind === "study" ? eq(users.accountType, "team") : undefined,
+            ),
           );
         if (targets.length !== inviteeIds.length)
           fail(
@@ -374,30 +419,34 @@ export class WorkspaceService {
           description,
           repositoryUrls,
           repositoryRelations: relations,
+          kind: kind as string,
           teamId,
           createdBy: u.id,
         })
         .returning();
       await recordRepositoryRegistrations(tx, p.id, u.id, [], repositoryUrls);
-      await tx
-        .insert(pm)
-        .values({
-          projectId: p.id,
-          userId: u.id,
-          accessRole: "manager",
-          rolesConfigured: true,
-        });
+      await tx.insert(pm).values({
+        projectId: p.id,
+        userId: u.id,
+        accessRole: "manager",
+        rolesConfigured: true,
+      });
       const createdRoles = await tx
         .insert(projectRoles)
         .values(
-          defaultProjectRoles(allProjectPermissions).map((role) => ({
+          (kind === "study"
+            ? studyRoleTemplates()
+            : defaultProjectRoles(allProjectPermissions)
+          ).map((role) => ({
             projectId: p.id,
             ...role,
           })),
         )
         .returning();
+      if(kind==="study")await tx.insert(studyRoleDefaults).values(createdRoles.map(role=>({roleId:role.id,permissions:JSON.stringify(role.permissions),templateVersion:1})));
       const administrator = createdRoles.find(
-        (role) => role.name === "프로젝트 관리자",
+        (role) =>
+          role.name === (kind === "study" ? "관리자" : "프로젝트 관리자"),
       )!;
       await tx
         .insert(projectMemberRoles)
@@ -415,6 +464,8 @@ export class WorkspaceService {
   }
   async update(u: User, id: string, body: Record<string, unknown>) {
     this.teamUser(u);
+    if (body.kind !== undefined)
+      fail(400, "VALIDATION_ERROR", "생성 후 종류는 변경할 수 없습니다.");
     const patch: Partial<typeof projects.$inferInsert> = {};
     if (body?.repositoryUrls !== undefined)
       patch.repositoryUrls = projectRepositories(body.repositoryUrls);
@@ -441,9 +492,29 @@ export class WorkspaceService {
     if (!Object.keys(patch).length)
       fail(400, "VALIDATION_ERROR", "변경할 내용을 입력해주세요.");
     return this.db.transaction(async (tx) => {
-      await this.manager(tx, u, id, "project.settings");
-      const [existing] = await tx.select().from(projects).where(eq(projects.id,id)).for("update");
-      if (patch.repositoryUrls) await recordRepositoryRegistrations(tx,id,u.id,existing.repositoryUrls,patch.repositoryUrls);
+      const managed = await this.manager(tx, u, id, "project.settings");
+      if (
+        managed.kind === "study" &&
+        (patch.repositoryUrls || patch.repositoryRelations)
+      )
+        fail(
+          400,
+          "VALIDATION_ERROR",
+          "스터디에는 저장소를 설정할 수 없습니다.",
+        );
+      const [existing] = await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, id))
+        .for("update");
+      if (patch.repositoryUrls)
+        await recordRepositoryRegistrations(
+          tx,
+          id,
+          u.id,
+          existing.repositoryUrls,
+          patch.repositoryUrls,
+        );
       if (patch.repositoryUrls && patch.repositoryRelations === undefined) {
         const selected = new Set(
           patch.repositoryUrls.map((url) => url.toLowerCase()),
@@ -478,6 +549,12 @@ export class WorkspaceService {
         .where(and(eq(users.id, inviteeId), eq(users.status, "active")));
       if (!target)
         fail(404, "USER_NOT_FOUND", "가입된 사용자를 찾을 수 없습니다.");
+      if (p.kind === "study" && target.accountType !== "team")
+        fail(
+          403,
+          "FORBIDDEN",
+          "스터디는 개발 사이트 회원만 초대할 수 있습니다.",
+        );
       const [member] = await tx
         .select()
         .from(pm)
@@ -511,7 +588,7 @@ export class WorkspaceService {
       fail(400, "VALIDATION_ERROR", "초대 처리 방식을 확인해주세요.");
     return this.db.transaction(async (tx) => {
       const [initial] = await tx
-        .select({ teamId: projects.teamId })
+        .select({ teamId: projects.teamId, kind: projects.kind })
         .from(invitations)
         .innerJoin(projects, eq(projects.id, invitations.projectId))
         .where(eq(invitations.id, id));
@@ -567,8 +644,10 @@ export class WorkspaceService {
         if (
           inviter?.status !== "active" ||
           inviter?.accountType !== "team" ||
-          !inviterTeam ||
-          !inviterAccess?.permissions.includes("members.manage")
+          (initial.kind !== "study" && !inviterTeam) ||
+          !inviterAccess?.permissions.some((x) =>
+            ["members.manage", "study.members.invite"].includes(x),
+          )
         )
           fail(
             409,
@@ -579,7 +658,9 @@ export class WorkspaceService {
           .select()
           .from(projects)
           .where(eq(projects.id, i.projectId));
-        if (u.accountType === "team")
+        if (p.kind === "study" && u.accountType !== "team")
+          fail(403, "FORBIDDEN", "스터디 회원 계정이 필요합니다.");
+        if (u.accountType === "team" && p.kind !== "study")
           await tx
             .insert(tm)
             .values({
@@ -602,6 +683,22 @@ export class WorkspaceService {
             accessRole: u.accountType === "team" ? "contributor" : "client",
           })
           .onConflictDoNothing();
+        if (p.kind === "study") {
+          const [role] = await tx
+            .select()
+            .from(projectRoles)
+            .where(
+              and(
+                eq(projectRoles.projectId, p.id),
+                eq(projectRoles.name, "회원"),
+              ),
+            );
+          if (role)
+            await tx
+              .insert(projectMemberRoles)
+              .values({ projectId: p.id, userId: u.id, roleId: role.id })
+              .onConflictDoNothing();
+        }
       }
       return (
         await tx
