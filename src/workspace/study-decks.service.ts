@@ -6,6 +6,7 @@ import * as Y from "yjs";
 import { DatabaseService } from "../db/database.service.js";
 import {
   studyDecks as decks,
+  studySessions as sessions,
   studyDeckAssets as deckAssets,
   studySubmissionVersions as submissions,
   studySubmissionAssets as submissionAssets,
@@ -99,6 +100,7 @@ export class StudyDecksService {
         body: submissions.body,
         title: activities.title,
         programId: activities.programId,
+        sessionId: activities.sessionId,
       })
       .from(submissions)
       .innerJoin(activities, eq(activities.id, submissions.activityId))
@@ -133,6 +135,11 @@ export class StudyDecksService {
         fail(403, "FORBIDDEN", "원본 제출물을 조회할 수 없습니다.");
       if ((!a.manage && !source) || a.program.archivedAt)
         fail(403, "FORBIDDEN", "발표 자료를 만들 수 없습니다.");
+      const sessionId = b.sessionId ? uuid(b.sessionId) : source?.sessionId ?? null;
+      if (sessionId) {
+        const [session] = await tx.select().from(sessions).where(and(eq(sessions.id, sessionId), eq(sessions.programId, programId)));
+        if (!session) fail(404, "NOT_FOUND", "이 프로그램의 회차를 찾을 수 없습니다.");
+      }
       const doc = new Y.Doc();
       const pages = doc.getArray<string>("pages");
       const page = crypto.randomUUID();
@@ -178,6 +185,7 @@ export class StudyDecksService {
           .insert(decks)
           .values({
             programId,
+            sessionId,
             title: bounded(
               b.title ??
                 (source
@@ -205,6 +213,7 @@ export class StudyDecksService {
         all = await tx
           .select({
             id: decks.id,
+            sessionId: decks.sessionId,
             title: decks.title,
             updatedAt: decks.updatedAt,
             sourceSubmissionId: decks.sourceSubmissionId,

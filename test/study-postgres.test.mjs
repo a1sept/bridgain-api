@@ -486,7 +486,11 @@ test(
       const deckService = new StudyDecksService(database);
       const deck = await deckService.create(owner, p.id, program.id, {
         title: "공동 발표",
+        sessionId: session.id,
       });
+      assert.equal(deck.sessionId, session.id);
+      assert.equal((await deckService.list(owner, p.id, program.id)).decks.find(d => d.id === deck.id).sessionId, session.id);
+      await assert.rejects(deckService.create(owner, p.id, program.id, { title: "잘못된 회차", sessionId: randomUUID() }));
       const left = new Y.Doc(),
         right = new Y.Doc();
       Y.applyUpdate(left, Buffer.from(deck.state, "base64"));
@@ -846,6 +850,7 @@ test(
       const firstPage = await study.snapshot(owner, p.id, {
         programId: pagedProgram.id,
       });
+      await assert.rejects(deckService.create(owner, p.id, pagedProgram.id, { title: "다른 프로그램 회차", sessionId: session.id }));
       assert.equal(firstPage.sessions.length, 50);
       assert.equal(firstPage.activities.length, 50);
       assert.equal(
@@ -853,6 +858,7 @@ test(
         52,
         "older session choices remain available for activity linking",
       );
+      assert.ok(firstPage.sessionOptions.every(s => s.status && s.startsAt && s.endsAt), "complete choices include card summary fields beyond the first page");
       const nextPage = await study.snapshot(owner, p.id, {
         programId: pagedProgram.id,
         sessionCursor: firstPage.pagination.sessions,

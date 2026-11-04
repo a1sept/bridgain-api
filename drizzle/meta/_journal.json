@@ -211,6 +211,13 @@
       "when": 1793227602229,
       "tag": "0032_study_series_thumbnails",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1793227602230,
+      "tag": "0033_study_deck_sessions",
+      "breakpoints": true
     }
   ]
 }

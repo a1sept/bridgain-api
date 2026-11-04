@@ -170,6 +170,7 @@ export const studySubmissionAssets = pgTable(
 );
 
 export const studyDecks = pgTable("study_decks", {
+  sessionId: uuid("session_id").references(() => studySessions.id),
   id: uuid("id").primaryKey().defaultRandom(),
   programId: uuid("program_id")
     .notNull()

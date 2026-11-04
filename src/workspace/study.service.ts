@@ -207,6 +207,9 @@ export class StudyService {
                   id: sessions.id,
                   title: sessions.title,
                   programId: sessions.programId,
+                  status: sessions.status,
+                  startsAt: sessions.startsAt,
+                  endsAt: sessions.endsAt,
                 })
                 .from(sessions)
                 .where(inArray(sessions.programId, listIds))
