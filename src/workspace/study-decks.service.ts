@@ -1,7 +1,7 @@
 import { StudyEventsService } from "./study-events.service.js";
 import { studySlide } from "./study-slide.js";
 import { Injectable } from "@nestjs/common";
-import { and, eq, desc, isNull, sql } from "drizzle-orm";
+import { and, eq, asc, desc, isNull, sql } from "drizzle-orm";
 import * as Y from "yjs";
 import { DatabaseService } from "../db/database.service.js";
 import {
@@ -140,6 +140,13 @@ export class StudyDecksService {
         const [session] = await tx.select().from(sessions).where(and(eq(sessions.id, sessionId), eq(sessions.programId, programId)));
         if (!session) fail(404, "NOT_FOUND", "이 프로그램의 회차를 찾을 수 없습니다.");
       }
+      // access() locks the project/program, so concurrent opens reuse one screen.
+      if (sessionId && !source) {
+        const [existing] = await tx.select().from(decks)
+          .where(and(eq(decks.programId, programId), eq(decks.sessionId, sessionId), isNull(decks.sourceSubmissionId)))
+          .orderBy(asc(decks.id)).limit(1);
+        if (existing) return existing;
+      }
       const doc = new Y.Doc();
       const pages = doc.getArray<string>("pages");
       const page = crypto.randomUUID();
@@ -219,7 +226,7 @@ export class StudyDecksService {
             sourceSubmissionId: decks.sourceSubmissionId,
           })
           .from(decks)
-          .where(eq(decks.programId, programId));
+          .where(eq(decks.programId, programId)).orderBy(asc(decks.id));
       const visible = [];
       for (const d of all)
         if (
@@ -227,7 +234,13 @@ export class StudyDecksService {
           (await this.source(tx, u, pid, programId, d.sourceSubmissionId))
         )
           visible.push(d);
-      return { decks: visible, canManage: a.manage && !a.program.archivedAt };
+      const defaults = new Set<string>();
+      const result = visible.map(d => {
+        const isSessionDefault = !!d.sessionId && !d.sourceSubmissionId && !defaults.has(d.sessionId);
+        if (isSessionDefault) defaults.add(d.sessionId!);
+        return { ...d, isSessionDefault };
+      });
+      return { decks: result, canManage: a.manage && !a.program.archivedAt };
     });
   }
   async get(u: User, pid: string, programId: string, id: string) {

@@ -489,6 +489,9 @@ test(
         sessionId: session.id,
       });
       assert.equal(deck.sessionId, session.id);
+      const reopened = await deckService.create(owner, p.id, program.id, { title: "중복 생성 방지", sessionId: session.id });
+      assert.equal(reopened.id, deck.id);
+      assert.equal((await deckService.list(owner, p.id, program.id)).decks.filter(d => d.sessionId === session.id && d.isSessionDefault).length, 1);
       assert.equal((await deckService.list(owner, p.id, program.id)).decks.find(d => d.id === deck.id).sessionId, session.id);
       await assert.rejects(deckService.create(owner, p.id, program.id, { title: "잘못된 회차", sessionId: randomUUID() }));
       const left = new Y.Doc(),
@@ -607,6 +610,8 @@ test(
         connectionId: ownerConnection,
       });
       assert.equal(room.hostId, owner.id);
+      assert.equal(room.shared.deckId, deck.id);
+      assert.equal(room.shared.pageId, page);
       await assert.rejects(
         study.updateProgram(owner, p.id, program.id, { action: "complete" }),
       );

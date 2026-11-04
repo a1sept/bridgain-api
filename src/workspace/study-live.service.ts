@@ -172,10 +172,24 @@ export class StudyLiveService {
             "ATTENDANCE_SETUP",
             "최소 참여 시간이 예정 회차 길이보다 깁니다. 공간 설정 또는 회차 시간을 확인해주세요.",
           );
+        const [defaultDeck] = await tx.select().from(decks)
+          .where(and(eq(decks.programId, c.program.id), eq(decks.sessionId, sid), isNull(decks.sourceSubmissionId)))
+          .orderBy(asc(decks.id)).limit(1);
+        let initialShared = "{}";
+        if (defaultDeck) {
+          const doc = new Y.Doc();
+          try {
+            Y.applyUpdate(doc, Buffer.from(defaultDeck.state, "base64"));
+            const pageId = doc.getArray<string>("pages").get(0);
+            if (pageId) initialShared = JSON.stringify({ type: "slide", deckId: defaultDeck.id, pageId,
+              ...studySlide(doc, pageId), sharedBy: u.id, sharedAt: now.toISOString() });
+          } finally { doc.destroy(); }
+        }
         [room] = await tx
           .insert(rooms)
           .values({
             sessionId: sid,
+            shared: initialShared,
             startedAt: now,
             originalHostId: u.id,
             hostId: u.id,
