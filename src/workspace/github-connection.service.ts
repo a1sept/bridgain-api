@@ -114,7 +114,7 @@ export class GithubConnectionService {
       key: Buffer.from(secret!, "hex"),
     };
   }
-  async status(userId: string) {
+  async status(userId: string, includeAccount = false) {
     let configured = true;
     try {
       this.config();
@@ -127,9 +127,23 @@ export class GithubConnectionService {
       .select()
       .from(githubConnections)
       .where(eq(githubConnections.userId, userId));
+    const connected = !!row && row.expiresAt > new Date();
+    let account: { login: string } | null = null;
+    if (connected && includeAccount) {
+      try {
+        // Read the identity of the saved token, not the browser's signed-in
+        // account or the owner of a repository shared with this user.
+        const profile = await this.api("/user", unseal(row.token, this.config().key));
+        if (typeof profile.login === "string" && /^[a-zA-Z0-9-]{1,39}$/.test(profile.login))
+          account = { login: profile.login };
+      } catch {
+        // Profile lookup failure must not hide existing repository controls.
+      }
+    }
     return {
       configured,
-      connected: configured && !!row && row.expiresAt > new Date(),
+      connected,
+      ...(includeAccount ? {account} : {}),
       installUrl: configured
         ? `https://github.com/apps/${encodeURIComponent(this.config().slug)}/installations/new`
         : null,

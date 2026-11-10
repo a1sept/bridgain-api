@@ -3,7 +3,7 @@ import { Body, Controller, Get, Post, Query, Req, Res } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { WorkspaceController } from "./workspace.controller.js";
 import { GithubConnectionService } from "./github-connection.service.js";
-import { githubAccountPage } from "./github-account-page.js";
+import { githubAccountPage, githubAccountResultPage } from "./github-account-page.js";
 import { fail } from "../auth/security.js";
 @Controller("workspace/github")
 export class GithubConnectionController {
@@ -24,7 +24,8 @@ export class GithubConnectionController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    return this.github.status((await this.user(req, res)).id);
+    res.setHeader("Cache-Control", "no-store");
+    return this.github.status((await this.user(req, res)).id, true);
   }
   @Post("desktop-connect") async desktopConnect(
     @Req() req: Request,
@@ -74,6 +75,23 @@ export class GithubConnectionController {
     // returned only in the callback HTML and never placed in URLs.
     return this.github.desktopDecision(body?.state,body?.secret,body?.decision);
   }
+  @Post("callback/choice") async choice(
+    @Res() res: Response,
+    @Body() body?: {state?:unknown; secret?:unknown; decision?:unknown},
+  ) {
+    const nonce = randomBytes(24).toString("base64");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`);
+    // Native form fallback uses the same one-use capability as the JSON route.
+    // It records a choice only; the authenticated desktop still claims it.
+    try {
+      await this.github.desktopDecision(body?.state, body?.secret, body?.decision);
+    } catch {
+      return res.status(400).type("html").send(githubAccountResultPage(nonce));
+    }
+    return res.type("html").send(githubAccountResultPage(nonce, body?.decision));
+  }
   @Get("callback") async callback(
     @Req() req: Request,
     @Res() res: Response,
@@ -85,7 +103,7 @@ export class GithubConnectionController {
       const result = await this.github.desktopCallback(state, code, error);
       if (result.authorized && result.account && result.decisionSecret) {
         const nonce = randomBytes(24).toString("base64");
-        res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src https://avatars.githubusercontent.com; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`);
+        res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src https://avatars.githubusercontent.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`);
         res.setHeader("Referrer-Policy","no-referrer");
         res.setHeader("Cache-Control","no-store");
         return res.type("html").send(githubAccountPage({nonce, state:state as string, secret:result.decisionSecret, login:result.account.login, accountId:result.account.id}));

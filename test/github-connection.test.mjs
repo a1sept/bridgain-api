@@ -52,6 +52,24 @@ test('missing configuration and malformed callbacks fail before network access',
   delete process.env.GITHUB_TOKEN_ENCRYPTION_KEY;
   await assert.rejects(service.start('user'), e => e.getStatus() === 503);
 });
+test('displayed GitHub identity comes from the currently saved token; failures never reuse an old identity', async () => {
+  configure(); const db=database(), service=new GithubConnectionService(db), key=Buffer.from(process.env.GITHUB_TOKEN_ENCRYPTION_KEY,'hex');
+  db.rows.set('user',{userId:'user',token:seal('account-a-token',key),expiresAt:new Date(Date.now()+60000)});
+  globalThis.fetch=async(url,init)=>{
+    assert.equal(url,'https://api.github.com/user');
+    return Response.json({login:init.headers.Authorization==='Bearer account-a-token'?'account-a':'account-b',email:'not-returned@example.test'});
+  };
+  assert.deepEqual((await service.status('user',true)).account,{login:'account-a'});
+  db.rows.get('user').token=seal('account-b-token',key);
+  assert.deepEqual((await service.status('user',true)).account,{login:'account-b'});
+  globalThis.fetch=async()=>Response.json({}, {status:503});
+  const failed=await service.status('user',true);
+  assert.equal(failed.connected,true);assert.equal(failed.account,null);
+  db.rows.get('user').expiresAt=new Date(0);
+  globalThis.fetch=async()=>{throw Error('expired connection must not fetch a profile');};
+  const expired=await service.status('user',true);
+  assert.equal(expired.connected,false);assert.equal(expired.account,null);
+});
 test('both public and private repositories use authorized installation lists and pagination', async () => {
   configure(); const db = database();
   db.rows.set('user', { token: seal('token', Buffer.from('ab'.repeat(32), 'hex')), expiresAt: new Date(Date.now() + 3600000) });
