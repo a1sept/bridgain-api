@@ -108,6 +108,31 @@ test('desktop OAuth SQL lifecycle, account confirmation, expiry and cancellation
       }
       globalThis.fetch=validFetch;
     });
+    await t.test('browser choices require the callback capability and desktop claim; cancel/switch preserve the existing connection', async()=>{
+      const before=(await connections())[0].token;
+      for (const decision of ['cancel','switch','connect']) {
+        const flow=await service.desktopConnect(uid,true);
+        assert.equal(new URL(flow.url).searchParams.get('prompt'),'select_account');
+        const callback=await service.desktopCallback(flow.state,'code');
+        assert.equal(callback.account.login,'test-user');assert(callback.decisionSecret);
+        assert(!JSON.stringify(callback).includes('github-private-token'));
+        const waiting=await complete(flow,true);
+        assert.equal(waiting.decision,'pending');assert.equal((await connections())[0].token,before);
+        await assert.rejects(service.desktopDecision(flow.state,'f'.repeat(64),decision));
+        await service.desktopDecision(flow.state,callback.decisionSecret,decision);
+        await assert.rejects(service.desktopDecision(flow.state,callback.decisionSecret,'connect'));
+        assert.equal((await complete(flow)).decision,decision);
+        assert.equal((await connections())[0].token,before);
+        if(decision==='connect') {
+          assert.equal((await complete(flow,true)).connected,true);
+        } else {
+          assert.equal((await complete(flow,true)).connected,false);
+          const payload=JSON.parse(unseal((await row(flow.state)).verifier,key));assert.equal(payload.token,undefined);
+          await service.desktopCancel(uid,flow.state,flow.claimSecret);
+          await assert.rejects(service.desktopDecision(flow.state,callback.decisionSecret,'connect'));
+        }
+      }
+    });
     await t.test('repository outage after commit reports the connection as committed', async()=>{
       const flow=await pending(); await service.desktopCallback(flow.state,'code');
       globalThis.fetch=async()=>{throw Error('outage');};

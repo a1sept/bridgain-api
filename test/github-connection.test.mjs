@@ -267,3 +267,12 @@ test('GitHub API distinguishes authentication, authorization and hidden resource
     }
   } finally { globalThis.fetch = oldFetch; }
 });
+
+test('browser account confirmation renders account and choices with a restricted CSP',async()=>{
+ const headers={};let html;
+ const controller=new GithubConnectionController({user:async()=>{throw Error('no browser login');}},{desktopCallback:async()=>({authorized:true,account:{id:1,login:'candidate-user'},decisionSecret:'b'.repeat(64)})});
+ const res={setHeader:(k,v)=>headers[k]=v,type:()=>res,send:v=>html=v};
+ await controller.callback({},res,'desktop.'+'a'.repeat(64),'spent-code');
+ assert.match(html,/@candidate-user/);assert.match(html,/연결하기/);assert.match(html,/GitHub 계정 변경/);assert.match(html,/취소/);
+ assert.match(headers['Content-Security-Policy'],/frame-ancestors 'none'/);assert.equal(headers['Cache-Control'],'no-store');assert(!html.includes('spent-code'));
+});

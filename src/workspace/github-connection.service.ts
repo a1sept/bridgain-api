@@ -67,6 +67,9 @@ type DesktopAuthorization = {
   kind: "desktop";
   phase: "pending" | "exchanging" | "ready" | "failed";
   claimHash: string;
+  browserConfirmation?: boolean;
+  decisionHash?: string;
+  decision?: "pending" | "connect" | "switch" | "cancel";
   verifier?: string;
   token?: string;
   tokenExpiresAt?: string;
@@ -132,7 +135,7 @@ export class GithubConnectionService {
         : null,
     };
   }
-  async desktopConnect(userId: string) {
+  async desktopConnect(userId: string, browserConfirmation = false) {
     const c = this.config();
     const state = `desktop.${randomBytes(32).toString("hex")}`;
     const claimSecret = randomBytes(32).toString("hex");
@@ -140,12 +143,12 @@ export class GithubConnectionService {
     await this.database.db.delete(githubStates).where(lt(githubStates.expiresAt, new Date()));
     await this.database.db.insert(githubStates).values({
       state: hash(state), userId,
-      verifier: seal(JSON.stringify({ kind: "desktop", phase: "pending", verifier, claimHash: hash(claimSecret) }), c.key),
+      verifier: seal(JSON.stringify({ kind: "desktop", phase: "pending", verifier, browserConfirmation, claimHash: hash(claimSecret) }), c.key),
       expiresAt: new Date(Date.now() + 600_000),
     });
     const url = new URL("https://github.com/login/oauth/authorize");
     url.search = new URLSearchParams({ client_id: c.clientId, redirect_uri: c.callback,
-      state, code_challenge: hashBase64(verifier), code_challenge_method: "S256" }).toString();
+      state, prompt: "select_account", code_challenge: hashBase64(verifier), code_challenge_method: "S256" }).toString();
     return { url: url.toString(), state, claimSecret };
   }
   private desktopState(state: unknown): string {
@@ -172,6 +175,7 @@ export class GithubConnectionService {
       .where(and(eq(githubStates.state, key), eq(githubStates.verifier, row.verifier), gt(githubStates.expiresAt, new Date())))
       .returning();
     if (!claimed) fail(400, "GITHUB_STATE_INVALID", "이미 처리되었거나 취소된 연결 요청이에요.");
+    const decisionSecret = randomBytes(32).toString("hex");
     let terminal: DesktopAuthorization = { kind: "desktop", phase: "failed", claimHash: payload.claimHash };
     if (error === undefined && typeof code === "string" && code.length > 0 && code.length <= 1024) {
       try {
@@ -189,6 +193,8 @@ export class GithubConnectionService {
           const account = await this.api("/user", data.access_token);
           if (Number.isSafeInteger(account.id) && account.id > 0 && typeof account.login === "string" && /^[a-zA-Z0-9-]{1,39}$/.test(account.login))
             terminal = { kind: "desktop", phase: "ready", claimHash: payload.claimHash,
+              browserConfirmation: payload.browserConfirmation,
+              ...(payload.browserConfirmation ? {decisionHash:hash(decisionSecret),decision:"pending" as const} : {}),
               token: data.access_token, tokenExpiresAt: expiresAt.toISOString(), account: { id: account.id, login: account.login } };
         }
       } catch { /* Store a terminal failure, never raw provider errors or credentials. */ }
@@ -199,7 +205,26 @@ export class GithubConnectionService {
       .where(and(eq(githubStates.state, key), eq(githubStates.verifier, exchanging), gt(githubStates.expiresAt, new Date())))
       .returning();
     if (!saved) fail(400, "GITHUB_STATE_INVALID", "연결 요청이 만료되었거나 취소됐어요.");
-    return { authorized: terminal.phase === "ready" };
+    return { authorized: terminal.phase === "ready", ...(terminal.phase === "ready" ? {account:terminal.account, ...(terminal.browserConfirmation ? {decisionSecret} : {})} : {}) };
+  }
+  // A callback-only capability permits a choice, never binding the account. The
+  // original desktop must still claim with its own secret and authenticated user.
+  async desktopDecision(state: unknown, secret: unknown, decision: unknown) {
+    const key = this.desktopState(state);
+    if (typeof secret !== "string" || !/^[a-f0-9]{64}$/.test(secret) || !["connect","switch","cancel"].includes(String(decision)))
+      fail(400, "GITHUB_STATE_INVALID", "연결 선택을 다시 확인해주세요.");
+    return this.database.db.transaction(async tx => {
+      const [row] = await tx.select().from(githubStates).where(and(eq(githubStates.state,key),gt(githubStates.expiresAt,new Date()))).for("update");
+      if (!row) fail(400,"GITHUB_STATE_INVALID","연결 요청이 만료되었거나 취소됐어요. 앱에서 다시 시작해주세요.");
+      const payload = this.desktopPayload(row.verifier);
+      if (payload.phase !== "ready" || !payload.decisionHash || !equal(payload.decisionHash,hash(secret as string)) || payload.decision !== "pending")
+        fail(400,"GITHUB_STATE_INVALID","이미 처리되었거나 유효하지 않은 연결 요청입니다.");
+      payload.decision = decision as "connect" | "switch" | "cancel";
+      // Discard the candidate token immediately when the user declines it.
+      if (decision !== "connect") { delete payload.token; delete payload.tokenExpiresAt; }
+      await tx.update(githubStates).set({verifier:seal(JSON.stringify(payload),this.config().key)}).where(eq(githubStates.state,key));
+      return {ok:true};
+    });
   }
   private async desktopClaim(userId: string, state: unknown, claimSecret: unknown, cancel: boolean, confirm = false) {
     const key = this.desktopState(state);
@@ -214,6 +239,8 @@ export class GithubConnectionService {
       if (!equal(payload.claimHash, hash(claimSecret as string)))
         fail(400, "GITHUB_STATE_INVALID", "GitHub 연결 확인 정보가 일치하지 않아요.");
       if (!cancel && ["pending", "exchanging"].includes(payload.phase)) return "pending";
+      if (!cancel && payload.browserConfirmation && payload.phase === "ready" && (!confirm || payload.decision !== "connect"))
+        return {connected:false as const,ready:true as const,account:payload.account,decision:payload.decision || "pending"};
       if (!cancel && payload.phase === "ready" && !confirm && payload.account && payload.tokenExpiresAt && new Date(payload.tokenExpiresAt) > new Date())
         return { connected: false as const, ready: true as const, account: payload.account };
       await tx.delete(githubStates).where(eq(githubStates.state, key));
